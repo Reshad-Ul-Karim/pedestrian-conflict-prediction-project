@@ -1,0 +1,171 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# PyTorch
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+# Keep model configs
+!configs/*.pt
+!configs/*.pth
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+*.out
+
+# Data directories
+data/rsud20k/images/
+data/rsud20k/annotations/
+data/rsud20k/labels/
+data/rsud20k/raw/
+data/badodd/
+data/dashcam_videos/*.mp4
+data/dashcam_videos/*.avi
+data/dashcam_videos/*.mov
+data/processed/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Output directories (keep structure, ignore contents)
+outputs/detections/*
+outputs/tracks/*
+outputs/trajectories/*
+outputs/predictions/*
+outputs/clips/*
+outputs/autolabels/*
+outputs/models/*
+outputs/reports/*
+outputs/videos/*
+# Keep directory structure
+!outputs/detections/.gitkeep
+!outputs/tracks/.gitkeep
+!outputs/trajectories/.gitkeep
+!outputs/predictions/.gitkeep
+!outputs/clips/.gitkeep
+!outputs/autolabels/.gitkeep
+!outputs/models/.gitkeep
+!outputs/reports/.gitkeep
+!outputs/videos/.gitkeep
+
+# Large files
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.joblib
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+.cache/
+
+# System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Weights & Biases
+wandb/
+
+# TensorBoard
+runs/
+events.out.tfevents.*
+
+# ONNX
+*.onnx
+
+# CoreML
+*.mlmodel
+*.mlpackage
+
+# Compressed files
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# Images (keep small examples, ignore large datasets)
+# Uncomment if you want to ignore all images
+# *.jpg
+# *.jpeg
+# *.png
+# *.gif
+# *.bmp
+
+# Documentation builds
+docs/_build/
+site/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Environment variables
+.env
+.env.local
+
+# macOS
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+ehthumbs.db
+ehthumbs_vista.db
+
+# Cursor/Debug logs
+.cursor/
+

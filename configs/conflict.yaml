@@ -1,0 +1,92 @@
+# Conflict Detection Configuration
+
+# Grid definition
+grid:
+  rows: 8
+  cols: 6
+  
+  # Ego vehicle corridor (image space)
+  ego_corridor:
+    - [6, 2]
+    - [6, 3]
+    - [7, 2]
+    - [7, 3]
+  
+  # Zone definitions
+  near_rows: [5, 6, 7]
+  far_rows: [0, 1, 2]
+  conflict_buffer: 1  # Additional cells around ego corridor
+
+# Conflict metrics
+metrics:
+  # Time horizons for conflict prediction
+  horizons: [1.0, 2.0, 3.0]  # seconds
+  
+  # Time-to-Conflict (TTC)
+  min_ttc: 0.5  # Minimum TTC to consider (seconds)
+  max_ttc: 5.0  # Maximum TTC to compute
+  
+  # Post-Encroachment Time (PET)
+  compute_pet: true
+  ego_speed_default: 30.0  # km/h (if not available from video)
+  
+  # Minimum Distance (MinD)
+  compute_mind: true
+  
+  # Collision probability
+  compute_collision_prob: true
+  uncertainty_weight: 1.0
+
+# Confidence weighting factors
+confidence:
+  # Weights for different factors
+  distance_weight: 0.3
+  velocity_weight: 0.25
+  stability_weight: 0.2
+  prediction_weight: 0.15
+  trajectory_length_weight: 0.1
+  
+  # Thresholds
+  high_confidence_threshold: 0.8
+  medium_confidence_threshold: 0.5
+  low_confidence_threshold: 0.3
+  
+  # Distance-based confidence
+  near_distance_pixels: 100  # Within this distance = high confidence
+  far_distance_pixels: 300   # Beyond this distance = low confidence
+  
+  # Velocity-based confidence
+  velocity_towards_threshold: 0.7  # Cosine similarity threshold
+  
+  # Stability-based confidence
+  max_velocity_variance: 50.0  # Maximum acceptable variance
+  min_track_length_frames: 15
+
+# Weak label generation
+labels:
+  # Label generation strategy
+  method: trajectory_based  # trajectory_based, horn_based, or hybrid
+  
+  # Trajectory-based labeling
+  trajectory:
+    use_predicted: true  # Use predicted trajectories
+    use_ground_truth: false  # Use ground truth trajectories (if available)
+    
+  # Signal-based labeling (optional)
+  signals:
+    use_horn_events: false
+    use_brake_events: false
+    horn_window: 2.0  # seconds before/after horn
+    brake_threshold: 0.5  # m/s^2
+    
+  # Confidence adjustment
+  adjust_confidence: true
+  min_samples_per_class: 10  # Minimum samples for confident labeling
+
+# Output configuration
+output:
+  save_metrics: true
+  save_visualizations: true
+  metrics_dir: outputs/autolabels
+  viz_dir: outputs/reports/conflict_viz
+

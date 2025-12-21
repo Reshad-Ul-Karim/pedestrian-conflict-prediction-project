@@ -1,0 +1,156 @@
+# Conflict Prediction Fusion Model Configuration
+
+# Model architecture
+architecture:
+  # Vision encoder (spatio-temporal)
+  vision:
+    type: resnet3d_18  # resnet3d_18, r2plus1d_18, timesformer, i3d
+    input_size: [128, 128]  # H, W
+    num_frames: 20
+    pretrained: true
+    freeze_backbone: false
+    output_dim: 512
+    
+  # Kinematics encoder (temporal)
+  kinematics:
+    type: bilstm  # bilstm, gru, transformer, tcn
+    input_dim: 16  # Feature dimension per frame
+    hidden_dim: 128
+    num_layers: 2
+    dropout: 0.1
+    bidirectional: true
+    output_dim: 256
+    
+  # Fusion module
+  fusion:
+    type: concat  # concat, cross_attention, late_fusion
+    hidden_dims: [256, 128]
+    dropout: 0.3
+    activation: relu
+    
+  # Prediction heads
+  heads:
+    num_horizons: 3  # 1s, 2s, 3s
+    predict_ttc: true
+    ttc_max: 3.0  # Maximum TTC value
+
+# Training configuration
+training:
+  # Data
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  
+  # Optimization
+  epochs: 50
+  optimizer: adamw
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  
+  # Learning rate schedule
+  scheduler: cosine  # cosine, step, plateau
+  warmup_epochs: 5
+  min_lr: 0.00001
+  
+  # Loss function
+  loss:
+    type: focal  # focal, bce, weighted_bce
+    focal_alpha: 0.25
+    focal_gamma: 2.0
+    use_confidence_weights: true
+    ttc_loss_weight: 0.1
+    
+  # Curriculum learning
+  curriculum:
+    enabled: true
+    phases:
+      - epoch: 0
+        min_confidence: 0.8
+      - epoch: 15
+        min_confidence: 0.6
+      - epoch: 30
+        min_confidence: 0.0
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 10
+    metric: val_loss
+    mode: min
+  
+  # Checkpointing
+  save_every: 5
+  save_best: true
+  checkpoint_dir: outputs/models/conflict_predictor
+
+# Data augmentation
+augmentation:
+  # Temporal augmentation
+  temporal:
+    random_frame_drop: 0.1
+    temporal_jitter: 0.05
+    
+  # Spatial augmentation (for visual clips)
+  spatial:
+    random_crop: true
+    crop_scale: [0.9, 1.0]
+    horizontal_flip: 0.5
+    color_jitter:
+      brightness: 0.2
+      contrast: 0.2
+      saturation: 0.1
+      
+  # Kinematic augmentation
+  kinematic:
+    add_noise: true
+    noise_std: 0.05
+
+# Validation
+validation:
+  val_split: 0.15
+  test_split: 0.15
+  stratify_by: video  # video or class
+  
+  # Metrics to track
+  metrics:
+    - precision
+    - recall
+    - f1
+    - roc_auc
+    - lead_time
+    - ece  # Expected Calibration Error
+    - brier_score
+    
+  # Evaluation intervals
+  eval_every: 1  # epochs
+  compute_detailed_metrics: true
+
+# Inference
+inference:
+  batch_size: 64
+  device: mps  # mps, cuda, cpu
+  threshold: 0.8  # Conflict probability threshold
+  alert_cooldown: 2.0  # seconds
+  
+  # TTA (Test-Time Augmentation)
+  tta:
+    enabled: false
+    num_augmentations: 5
+
+# Model distillation (for deployment)
+distillation:
+  enabled: false
+  teacher_model: outputs/models/conflict_predictor/best.pt
+  
+  # Student model (lighter)
+  student:
+    vision: mobilenetv3_small
+    kinematics: gru
+    hidden_dim: 64
+    
+  # Distillation training
+  temperature: 5.0
+  alpha: 0.7  # Weight for hard labels
+  epochs: 30
+  learning_rate: 0.001
+

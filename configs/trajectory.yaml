@@ -1,0 +1,83 @@
+# Trajectory Extraction and Prediction Configuration
+
+# MediaPipe Pose configuration
+mediapipe:
+  model_complexity: 1  # 0, 1, or 2 (higher = more accurate but slower)
+  min_detection_confidence: 0.5
+  min_tracking_confidence: 0.5
+  smooth_landmarks: true
+  enable_segmentation: false
+  
+  # Anchor point selection
+  anchor_point: foot_midpoint  # foot_midpoint, hip_midpoint, or bbox_center
+  fallback_anchor: hip_midpoint
+
+# Trajectory smoothing
+smoothing:
+  method: savgol  # savgol, kalman, or moving_average
+  window_size: 5
+  poly_order: 2
+  
+# Kinematics computation
+kinematics:
+  fps: 30  # Video frame rate
+  min_track_length: 10  # Minimum frames to compute kinematics
+  
+  # Differentiation method
+  velocity_method: savgol
+  acceleration_method: savgol
+  
+  # Outlier removal
+  remove_outliers: true
+  outlier_threshold: 3.0  # Standard deviations
+
+# Quality metrics
+quality:
+  min_smoothness: 0.0  # Minimum trajectory smoothness score
+  min_confidence: 0.3  # Minimum average detection confidence
+  max_occlusion_ratio: 0.3  # Maximum ratio of interpolated frames
+
+# Trajectory prediction model
+prediction:
+  model_type: transformer  # transformer, lstm, gru, or physics
+  
+  # Input configuration
+  past_frames: 20  # Number of past frames (history window)
+  future_horizons: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]  # Prediction horizons in seconds
+  
+  # Model architecture
+  transformer:
+    d_model: 128
+    nhead: 4
+    num_encoder_layers: 3
+    num_decoder_layers: 2
+    dim_feedforward: 256
+    dropout: 0.1
+    
+  lstm:
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.1
+    bidirectional: true
+    
+  # Training
+  batch_size: 32
+  epochs: 50
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  
+  # Loss configuration
+  loss_type: nll  # nll (negative log-likelihood) or mse
+  uncertainty_estimation: true
+  
+# Social interaction (for multi-agent prediction)
+social:
+  enabled: false  # Enable graph-based social interaction
+  interaction_radius: 100  # Pixels
+  max_neighbors: 10
+  
+  # GNN configuration
+  gnn_type: gat  # gcn or gat
+  num_gnn_layers: 2
+  gnn_hidden_dim: 64
+

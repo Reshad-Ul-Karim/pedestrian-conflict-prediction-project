@@ -1,0 +1,54 @@
+# ByteTrack Configuration
+# Multi-object tracking parameters
+
+tracker:
+  name: bytetrack
+  
+  # Detection thresholds
+  track_high_thresh: 0.6  # High confidence threshold for first association
+  track_low_thresh: 0.1   # Low confidence threshold for second association
+  new_track_thresh: 0.7   # Threshold for creating new tracks
+  
+  # Matching thresholds
+  match_thresh: 0.8       # IoU threshold for matching
+  proximity_thresh: 0.5   # Proximity threshold for second association
+  appearance_thresh: 0.25 # Appearance similarity threshold (if using ReID)
+  
+  # Track lifecycle
+  track_buffer: 30        # Number of frames to keep lost tracks
+  frame_rate: 30          # Video frame rate
+  min_box_area: 10        # Minimum bounding box area
+  
+  # Kalman filter parameters
+  kalman:
+    std_weight_position: 1.0 / 20
+    std_weight_velocity: 1.0 / 160
+    
+# Detection configuration
+detection:
+  model_path: outputs/models/detector_rsud20k/weights/best.pt
+  conf_threshold: 0.5
+  iou_threshold: 0.45
+  max_det: 300
+  device: mps  # mps, cuda, or cpu
+  
+  # Classes to track (empty list = all classes)
+  classes: []  # [0, 1, 2, 3]  # person, bicycle, motorcycle, car
+  
+# Output configuration
+output:
+  save_video: true
+  save_tracks: true
+  save_format: jsonl  # jsonl or json
+  tracks_dir: outputs/tracks
+  video_dir: outputs/videos
+  
+  # Visualization
+  show_labels: true
+  show_conf: true
+  show_trajectory: true
+  trajectory_length: 30  # Number of past positions to show
+  
+  # FPS limit for visualization
+  display_fps: 30
+
