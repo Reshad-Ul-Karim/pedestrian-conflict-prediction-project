@@ -56,40 +56,30 @@ logs/
 *.out
 
 # Data directories
-data/rsud20k/images/
-data/rsud20k/annotations/
-data/rsud20k/labels/
-data/rsud20k/raw/
-data/badodd/
-data/dashcam_videos/*.mp4
-data/dashcam_videos/*.avi
-data/dashcam_videos/*.mov
-data/processed/
+data/
+!data/*.yaml
+!data/*.txt
+!data/*.md
+data/**/*
+!data/**/*.yaml
+!data/**/*.txt
+!data/**/*.md
+
+# Dataset directories (root level)
+rsud20k/
+rsud20k_person2000_resized/
+
+# Video files
 *.mp4
 *.avi
 *.mov
 *.mkv
 
-# Output directories (keep structure, ignore contents)
-outputs/detections/*
-outputs/tracks/*
-outputs/trajectories/*
-outputs/predictions/*
-outputs/clips/*
-outputs/autolabels/*
-outputs/models/*
-outputs/reports/*
-outputs/videos/*
-# Keep directory structure
-!outputs/detections/.gitkeep
-!outputs/tracks/.gitkeep
-!outputs/trajectories/.gitkeep
-!outputs/predictions/.gitkeep
-!outputs/clips/.gitkeep
-!outputs/autolabels/.gitkeep
-!outputs/models/.gitkeep
-!outputs/reports/.gitkeep
-!outputs/videos/.gitkeep
+# Output directories (ignore all contents)
+outputs/
+outputs/**/*
+# Keep directory structure files if needed
+!outputs/.gitkeep
 
 # Large files
 *.npy

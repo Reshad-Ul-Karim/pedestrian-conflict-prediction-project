@@ -38,3 +38,10 @@ pyyaml>=6.0
 
 # Web/HTTP (for dataset download)
 requests>=2.31.0
+
+# FT-Transformer and Tabular Models
+pytorch-tabular>=1.0.0
+
+# Hyperparameter Tuning
+ray[tune]>=2.5.0
+optuna>=3.0.0

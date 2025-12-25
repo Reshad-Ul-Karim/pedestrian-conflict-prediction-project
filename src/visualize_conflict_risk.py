@@ -14,6 +14,35 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon, Rectangle
 import math
 import json
+import warnings
+import logging
+import os
+import sys
+from contextlib import contextmanager
+from typing import Optional
+
+# Suppress MediaPipe warnings about NORM_RECT
+# MediaPipe uses glog (C++ logging), so we must set env vars BEFORE importing MediaPipe
+# Note: MediaPipe uses CPU (GPU is only for YOLO and SegFormer)
+os.environ['GLOG_minloglevel'] = '2'  # Only show ERROR and FATAL (0=INFO, 1=WARNING, 2=ERROR)
+os.environ['GLOG_logtostderr'] = '0'  # Don't log to stderr
+os.environ['GLOG_stderrthreshold'] = '2'  # Only show ERROR and FATAL on stderr
+logging.getLogger().setLevel(logging.ERROR)
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', message='.*NORM_RECT.*')
+warnings.filterwarnings('ignore', message='.*IMAGE_DIMENSIONS.*')
+
+# Context manager to suppress stderr during MediaPipe processing
+@contextmanager
+def suppress_stderr():
+    """Temporarily suppress stderr to hide MediaPipe C++ warnings"""
+    with open(os.devnull, 'w') as devnull:
+        old_stderr = sys.stderr
+        try:
+            sys.stderr = devnull
+            yield
+        finally:
+            sys.stderr = old_stderr
 
 # Try to import MediaPipe with error handling
 MP_AVAILABLE = False
@@ -56,19 +85,45 @@ except ImportError:
     ROAD_DETECTOR_AVAILABLE = False
     print("Note: Road detector not available. Install transformers: pip install transformers")
 
+# Try to import multi-modal fusion
+try:
+    from multimodal_road_fusion import MultiModalRoadFusion
+    FUSION_AVAILABLE = True
+except ImportError:
+    FUSION_AVAILABLE = False
+    MultiModalRoadFusion = None
+
+# Import YOLO for person detection
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("Note: YOLO not available. Install ultralytics: pip install ultralytics")
+
 
 class RoadGrid:
-    """SegFormer-based road grid with polygonal road region"""
+    """
+    ENHANCED SegFormer-based road grid with state-of-the-art multi-modal fusion
+    
+    Features:
+    - SegFormer automatic road detection (high recall)
+    - Manual trapezoid annotation (high precision, expert knowledge)
+    - State-of-the-art fusion combining both methods
+    - Confidence-weighted and uncertainty-aware fusion
+    """
     
     def __init__(self, img_width=640, img_height=640, 
-                 grid_rows=8, grid_cols=6,
+                 grid_rows=12, grid_cols=12,
                  road_mask=None,
                  road_polygon=None,
                  sidewalk_mask=None,
                  pavement_width=50,
-                 calibration_file=None):
+                 calibration_file=None,
+                 use_fusion: bool = True,
+                 segformer_confidence: Optional[np.ndarray] = None):
         """
-        Initialize road grid based on SegFormer road detection
+        Initialize road grid with multi-modal fusion
         
         Args:
             img_width: Image width
@@ -80,16 +135,20 @@ class RoadGrid:
             sidewalk_mask: Binary sidewalk mask from SegFormer (optional)
             pavement_width: Width of pavement extensions (if not using sidewalk_mask)
             calibration_file: Path to calibration JSON file (optional, for backward compatibility)
+            use_fusion: Enable state-of-the-art multi-modal fusion (default: True)
+            segformer_confidence: Confidence map from SegFormer (H, W), float [0, 1] (optional)
         """
         self.img_width = img_width
         self.img_height = img_height
         self.grid_rows = grid_rows
         self.grid_cols = grid_cols
+        self.use_fusion = use_fusion and FUSION_AVAILABLE
         
         # SegFormer-based road region (separate feature)
         self.road_mask = road_mask  # SegFormer road mask
         self.road_polygon = road_polygon  # SegFormer road polygon
         self.sidewalk_mask = sidewalk_mask  # SegFormer sidewalk mask
+        self.segformer_confidence = segformer_confidence  # SegFormer confidence map
         
         # Manual trapezoid (separate feature, loaded from calibration)
         self.manual_trapezoid = None
@@ -116,15 +175,76 @@ class RoadGrid:
                          (int(center_x + road_width/2), img_height),
                          255, -1)
         
+        # State-of-the-art multi-modal fusion
+        self.fused_mask = None
+        self.fusion_result = None
+        if self.use_fusion and self.manual_trapezoid_mask is not None:
+            self._perform_fusion()
+        
+        # Use fused mask if available, otherwise use SegFormer mask
+        self.active_road_mask = self.fused_mask if (self.fused_mask is not None) else self.road_mask
+        
         # Derive pavement mask from SegFormer sidewalk or adjacent areas
         self.pavement_mask = self._derive_pavement_mask(adjacent_threshold=50)
         
-        # Compute road bounding box for grid
+        # Compute road bounding box for grid (use active mask)
         self._compute_road_bbox()
         
         # Grid cell dimensions (based on road bounding box)
         self.cell_width = (self.road_bbox[2] - self.road_bbox[0]) / grid_cols if grid_cols > 0 else img_width / grid_cols
         self.cell_height = (self.road_bbox[3] - self.road_bbox[1]) / grid_rows if grid_rows > 0 else img_height / grid_rows
+    
+    def _perform_fusion(self):
+        """Perform state-of-the-art multi-modal fusion"""
+        if not FUSION_AVAILABLE or self.manual_trapezoid_mask is None:
+            return
+        
+        try:
+            fusion_module = MultiModalRoadFusion(
+                confidence_threshold=0.7,
+                agreement_weight=0.8,
+                uncertainty_threshold=0.3
+            )
+            
+            # Perform fusion
+            self.fusion_result = fusion_module.fuse_road_masks(
+                manual_mask=self.manual_trapezoid_mask,
+                segformer_mask=self.road_mask,
+                segformer_confidence=self.segformer_confidence,
+                image_shape=(self.img_height, self.img_width)
+            )
+            
+            # Store fused mask
+            self.fused_mask = self.fusion_result['fused_mask']
+            
+            # Update road polygon from fused mask
+            self._update_road_polygon_from_fused_mask()
+            
+        except Exception as e:
+            print(f"⚠ Fusion failed: {e}, using SegFormer mask")
+            self.fused_mask = None
+            self.fusion_result = None
+    
+    def _update_road_polygon_from_fused_mask(self):
+        """Update road polygon from fused mask"""
+        if self.fused_mask is None:
+            return
+        
+        # Find contours
+        contours, _ = cv2.findContours(
+            self.fused_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        
+        if contours:
+            # Get largest contour
+            largest_contour = max(contours, key=cv2.contourArea)
+            
+            # Simplify contour
+            epsilon = 0.01 * cv2.arcLength(largest_contour, True)
+            simplified = cv2.approxPolyDP(largest_contour, epsilon, True)
+            
+            # Convert to list of tuples
+            self.road_polygon = [(float(pt[0][0]), float(pt[0][1])) for pt in simplified]
     
     def _derive_pavement_mask(self, adjacent_threshold=50):
         """
@@ -159,10 +279,13 @@ class RoadGrid:
         return pavement_mask
     
     def _compute_road_bbox(self):
-        """Compute bounding box of road region"""
-        if self.road_mask is not None:
+        """Compute bounding box of road region (uses active_road_mask if fusion is enabled)"""
+        # Use active_road_mask (fused if available, otherwise SegFormer)
+        mask_to_use = self.active_road_mask if hasattr(self, 'active_road_mask') else self.road_mask
+        
+        if mask_to_use is not None:
             # Get bounding box from mask
-            coords = np.column_stack(np.where(self.road_mask > 0))
+            coords = np.column_stack(np.where(mask_to_use > 0))
             if len(coords) > 0:
                 y_min, x_min = coords.min(axis=0)
                 y_max, x_max = coords.max(axis=0)
@@ -182,8 +305,8 @@ class RoadGrid:
         with open(calibration_file, 'r') as f:
             cal = json.load(f)
         
-        self.grid_rows = cal.get('grid_rows', 8)
-        self.grid_cols = cal.get('grid_cols', 6)
+        self.grid_rows = cal.get('grid_rows', 12)
+        self.grid_cols = cal.get('grid_cols', 12)
         
         # Load manual trapezoid from calibration (separate feature, not replacing SegFormer)
         if 'street_trapezoid' in cal:
@@ -249,13 +372,14 @@ class RoadGrid:
         row = max(0, min(self.grid_rows - 1, row))
         return (row, col)
     
-    def is_in_street(self, x, y, use_segformer=True):
+    def is_in_street(self, x, y, use_segformer=True, use_fused=True):
         """
         Check if point is in road region
         
         Args:
             x, y: Point coordinates
             use_segformer: If True, check SegFormer road; if False, check manual trapezoid
+            use_fused: If True and fusion is available, use fused mask (default: True)
         
         Returns:
             True if point is in the specified road region
@@ -263,6 +387,10 @@ class RoadGrid:
         px, py = int(x), int(y)
         if not (0 <= px < self.img_width and 0 <= py < self.img_height):
             return False
+        
+        # Use fused mask if available and requested
+        if use_fused and self.fused_mask is not None:
+            return self.fused_mask[py, px] > 0
         
         if use_segformer:
             # Check SegFormer road mask
@@ -522,6 +650,7 @@ class PoseAnalyzer:
         
         try:
             self.mp_pose = mp.solutions.pose
+            # MediaPipe uses CPU (GPU is only for YOLO and SegFormer)
             self.pose = self.mp_pose.Pose(
                 model_complexity=1,
                 min_detection_confidence=0.5,
@@ -532,6 +661,43 @@ class PoseAnalyzer:
             print(f"Warning: MediaPipe initialization failed: {e}")
             self.mp_pose = None
             self.pose = None
+    
+    def detect_all_poses(self, image):
+        """Detect all poses in the full image"""
+        if self.pose is None:
+            return []
+        
+        # Convert to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        h, w = image.shape[:2]
+        
+        # Process full image with stderr suppression to hide MediaPipe C++ warnings
+        with suppress_stderr():
+            results = self.pose.process(image_rgb)
+        
+        all_poses = []
+        if results.pose_landmarks:
+            # Convert landmarks to image coordinates
+            landmarks = {}
+            for landmark in self.mp_pose.PoseLandmark:
+                lm = results.pose_landmarks.landmark[landmark.value]
+                if lm.visibility > 0.3:  # Only include visible landmarks
+                    x = int(lm.x * w)
+                    y = int(lm.y * h)
+                    landmarks[landmark] = {
+                        'x': x,
+                        'y': y,
+                        'z': lm.z,
+                        'visibility': lm.visibility
+                    }
+            
+            if landmarks:
+                all_poses.append({
+                    'landmarks': landmarks,
+                    'confidence': np.mean([lm['visibility'] for lm in landmarks.values()])
+                })
+        
+        return all_poses
     
     def extract_pose(self, image, bbox):
         """Extract pose landmarks from person crop"""
@@ -558,7 +724,10 @@ class PoseAnalyzer:
         
         # Convert to RGB
         person_rgb = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
-        results = self.pose.process(person_rgb)
+        
+        # Process pose with stderr suppression to hide MediaPipe C++ warnings
+        with suppress_stderr():
+            results = self.pose.process(person_rgb)
         
         if not results.pose_landmarks:
             return None
@@ -648,52 +817,462 @@ class PoseAnalyzer:
             'left_ankle': (left_ankle['x'], left_ankle['y']),
             'right_ankle': (right_ankle['x'], right_ankle['y'])
         }
-
-
-def compute_conflict_risk(person_center, pose_data, road_grid, pose_analyzer):
-    """
-    Compute conflict risk score (0-1) using BOTH SegFormer and manual trapezoid parameters
     
-    Factors:
-    1. Position: In SegFormer road? In manual trapezoid? Proximity? (0.4 weight)
-    2. Agreement: Both SegFormer and manual agree on road? (0.1 weight)
-    3. Pose: Body inclining towards road? (0.5 weight)
+    def extract_advanced_pose_features(self, pose_data):
+        """
+        Extract advanced pose features: torso lean, head orientation, stride estimation
+        
+        Returns:
+            dict with advanced pose features
+        """
+        if self.mp_pose is None or pose_data is None:
+            return {}
+        
+        landmarks = pose_data['landmarks']
+        features = {}
+        
+        # 1. Torso lean (forward/backward inclination)
+        left_shoulder = landmarks.get(self.mp_pose.PoseLandmark.LEFT_SHOULDER)
+        right_shoulder = landmarks.get(self.mp_pose.PoseLandmark.RIGHT_SHOULDER)
+        left_hip = landmarks.get(self.mp_pose.PoseLandmark.LEFT_HIP)
+        right_hip = landmarks.get(self.mp_pose.PoseLandmark.RIGHT_HIP)
+        
+        if all([left_shoulder, right_shoulder, left_hip, right_hip]):
+            shoulder_mid = (
+                (left_shoulder['x'] + right_shoulder['x']) / 2,
+                (left_shoulder['y'] + right_shoulder['y']) / 2
+            )
+            hip_mid = (
+                (left_hip['x'] + right_hip['x']) / 2,
+                (left_hip['y'] + right_hip['y']) / 2
+            )
+            
+            # Calculate vertical angle (0 = upright, positive = leaning forward)
+            dx = shoulder_mid[0] - hip_mid[0]
+            dy = shoulder_mid[1] - hip_mid[1]
+            torso_angle = math.degrees(math.atan2(dy, abs(dx)))
+            features['torso_lean_angle'] = torso_angle  # Forward lean = higher risk
+        
+        # 2. Head orientation (where person is looking)
+        nose = landmarks.get(self.mp_pose.PoseLandmark.NOSE)
+        left_ear = landmarks.get(self.mp_pose.PoseLandmark.LEFT_EAR)
+        right_ear = landmarks.get(self.mp_pose.PoseLandmark.RIGHT_EAR)
+        
+        if nose and left_ear and right_ear:
+            # Calculate head direction vector
+            ear_mid = (
+                (left_ear['x'] + right_ear['x']) / 2,
+                (left_ear['y'] + right_ear['y']) / 2
+            )
+            head_vector = (
+                nose['x'] - ear_mid[0],
+                nose['y'] - ear_mid[1]
+            )
+            head_angle = math.degrees(math.atan2(head_vector[1], head_vector[0]))
+            features['head_orientation_angle'] = head_angle
+        
+        # 3. Leg separation (stride estimation)
+        left_ankle = landmarks.get(self.mp_pose.PoseLandmark.LEFT_ANKLE)
+        right_ankle = landmarks.get(self.mp_pose.PoseLandmark.RIGHT_ANKLE)
+        
+        if left_ankle and right_ankle:
+            leg_separation = math.sqrt(
+                (left_ankle['x'] - right_ankle['x'])**2 + 
+                (left_ankle['y'] - right_ankle['y'])**2
+            )
+            features['leg_separation'] = leg_separation
+            
+            # Stride estimation (larger separation = mid-stride)
+            if left_hip and right_hip:
+                hip_width = math.sqrt(
+                    (left_hip['x'] - right_hip['x'])**2 + 
+                    (left_hip['y'] - right_hip['y'])**2
+                )
+                stride_ratio = leg_separation / (hip_width + 1e-6)
+                features['estimated_stride_ratio'] = stride_ratio
+        
+        # 4. Arm position (crossing detection)
+        left_wrist = landmarks.get(self.mp_pose.PoseLandmark.LEFT_WRIST)
+        right_wrist = landmarks.get(self.mp_pose.PoseLandmark.RIGHT_WRIST)
+        
+        if left_wrist and right_wrist and left_shoulder and right_shoulder:
+            # Check if wrists are crossed (close to opposite shoulders)
+            dist_lw_rs = math.sqrt(
+                (left_wrist['x'] - right_shoulder['x'])**2 + 
+                (left_wrist['y'] - right_shoulder['y'])**2
+            )
+            dist_rw_ls = math.sqrt(
+                (right_wrist['x'] - left_shoulder['x'])**2 + 
+                (right_wrist['y'] - left_shoulder['y'])**2
+            )
+            # If wrists are close to opposite shoulders, arms might be crossed
+            arm_crossing_score = 1.0 / (1.0 + min(dist_lw_rs, dist_rw_ls) / 100.0)
+            features['arm_crossing_score'] = arm_crossing_score
+        
+        return features
+
+
+def calculate_bbox_distance(bbox1, bbox2):
+    """
+    Calculate minimum distance between two bounding boxes
+    
+    Args:
+        bbox1: (x1, y1, x2, y2)
+        bbox2: (x1, y1, x2, y2)
+    
+    Returns:
+        Minimum distance in pixels
+    """
+    x1_1, y1_1, x2_1, y2_1 = bbox1
+    x1_2, y1_2, x2_2, y2_2 = bbox2
+    
+    # Calculate center points
+    center1 = ((x1_1 + x2_1) / 2, (y1_1 + y2_1) / 2)
+    center2 = ((x1_2 + x2_2) / 2, (y1_2 + y2_2) / 2)
+    
+    # Euclidean distance between centers
+    distance = math.sqrt((center1[0] - center2[0])**2 + (center1[1] - center2[1])**2)
+    
+    # If boxes overlap, return 0
+    if not (x2_1 < x1_2 or x2_2 < x1_1 or y2_1 < y1_2 or y2_2 < y1_1):
+        return 0.0
+    
+    return distance
+
+
+def extract_spatial_relationships(person_bbox, all_detections, image_shape):
+    """
+    Extract spatial relationship features with other objects
+    
+    Args:
+        person_bbox: (x1, y1, x2, y2) person bounding box
+        all_detections: List of dicts with 'bbox' and 'class' keys
+        image_shape: (height, width) of image
+    
+    Returns:
+        dict with spatial relationship features
+    """
+    features = {}
+    h, w = image_shape[:2]
+    
+    # Filter vehicles (car, bus, truck, motorcycle, etc.)
+    vehicle_classes = ['car', 'bus', 'truck', 'motorcycle', 'van', 'pickup']
+    vehicles = [d for d in all_detections 
+                if d.get('class', '').lower() in vehicle_classes or 
+                   d.get('class_id') in [3, 4, 5, 2, 8, 9]]  # RSUD20K class IDs
+    
+    if vehicles:
+        # Distance to nearest vehicle
+        min_distance = min([
+            calculate_bbox_distance(person_bbox, v['bbox']) 
+            for v in vehicles
+        ])
+        features['min_distance_to_vehicle'] = min_distance
+        features['min_distance_to_vehicle_norm'] = min_distance / math.sqrt(h**2 + w**2)  # Normalized
+        
+        # Find nearest vehicle
+        nearest_vehicle = min(vehicles, 
+                             key=lambda v: calculate_bbox_distance(person_bbox, v['bbox']))
+        features['nearest_vehicle_type'] = nearest_vehicle.get('class', 'unknown')
+        
+        # Relative position to nearest vehicle
+        p_center = ((person_bbox[0] + person_bbox[2]) / 2, (person_bbox[1] + person_bbox[3]) / 2)
+        v_bbox = nearest_vehicle['bbox']
+        v_center = ((v_bbox[0] + v_bbox[2]) / 2, (v_bbox[1] + v_bbox[3]) / 2)
+        
+        # Determine relative position
+        dx = p_center[0] - v_center[0]
+        dy = p_center[1] - v_center[1]
+        
+        if abs(dx) > abs(dy):
+            relative_pos = 'side' if dx > 0 else 'side'
+        else:
+            relative_pos = 'front' if dy < 0 else 'behind'
+        
+        features['relative_position_to_vehicle'] = relative_pos
+        features['relative_x_to_vehicle'] = dx / w  # Normalized
+        features['relative_y_to_vehicle'] = dy / h  # Normalized
+    else:
+        features['min_distance_to_vehicle'] = float('inf')
+        features['min_distance_to_vehicle_norm'] = 1.0
+        features['nearest_vehicle_type'] = 'none'
+        features['relative_position_to_vehicle'] = 'none'
+        features['relative_x_to_vehicle'] = 0.0
+        features['relative_y_to_vehicle'] = 0.0
+    
+    # Count nearby pedestrians (within threshold distance)
+    pedestrians = [d for d in all_detections 
+                   if d.get('class', '').lower() == 'person' or d.get('class_id') == 0]
+    
+    nearby_threshold = 200  # pixels
+    nearby_pedestrians = [
+        p for p in pedestrians 
+        if calculate_bbox_distance(person_bbox, p['bbox']) < nearby_threshold
+    ]
+    features['nearby_pedestrians_count'] = len(nearby_pedestrians)
+    
+    return features
+
+
+def extract_scene_context(image, road_grid, all_detections, person_bbox):
+    """
+    Extract scene-level context features
+    
+    Args:
+        image: Image array
+        road_grid: RoadGrid instance
+        all_detections: List of all detections
+        person_bbox: Person bounding box
+    
+    Returns:
+        dict with scene context features
+    """
+    features = {}
+    h, w = image.shape[:2]
+    image_area = h * w
+    
+    # 1. Traffic density
+    vehicle_classes = ['car', 'bus', 'truck', 'motorcycle', 'van', 'pickup']
+    vehicles = [d for d in all_detections 
+                if d.get('class', '').lower() in vehicle_classes or 
+                   d.get('class_id') in [3, 4, 5, 2, 8, 9]]
+    pedestrians = [d for d in all_detections 
+                   if d.get('class', '').lower() == 'person' or d.get('class_id') == 0]
+    
+    features['traffic_density'] = len(vehicles) / (image_area / 10000)  # Vehicles per 10k pixels
+    features['pedestrian_density'] = len(pedestrians) / (image_area / 10000)
+    
+    # 2. Road area ratio
+    if road_grid.road_mask is not None:
+        road_area = np.sum(road_grid.road_mask > 0)
+        features['road_area_ratio'] = road_area / image_area
+    else:
+        features['road_area_ratio'] = 0.0
+    
+    # 3. Crosswalk detection (simplified - check if person is near road center)
+    if road_grid.road_mask is not None:
+        # Check if person is in road center (likely crosswalk area)
+        p_center = ((person_bbox[0] + person_bbox[2]) / 2, (person_bbox[1] + person_bbox[3]) / 2)
+        if road_grid.is_in_street(p_center[0], p_center[1], use_segformer=True):
+            # Check if in center region of road
+            road_coords = np.column_stack(np.where(road_grid.road_mask > 0))
+            if len(road_coords) > 0:
+                road_center_y = road_coords[:, 0].mean()
+                road_center_x = road_coords[:, 1].mean()
+                dist_to_road_center = math.sqrt(
+                    (p_center[0] - road_center_x)**2 + (p_center[1] - road_center_y)**2
+                )
+                features['distance_to_road_center'] = dist_to_road_center / math.sqrt(h**2 + w**2)
+            else:
+                features['distance_to_road_center'] = 1.0
+        else:
+            features['distance_to_road_center'] = 1.0
+    else:
+        features['distance_to_road_center'] = 1.0
+    
+    # 4. Intersection detection (simplified - multiple road segments)
+    # Check if road mask has multiple disconnected regions (indicates intersection)
+    if road_grid.road_mask is not None:
+        try:
+            from scipy import ndimage
+            labeled, num_features = ndimage.label(road_grid.road_mask > 0)
+            features['road_segments_count'] = num_features
+            features['is_intersection'] = 1.0 if num_features > 1 else 0.0
+        except ImportError:
+            # Fallback: simple heuristic (check if road area is large and spread out)
+            road_coords = np.column_stack(np.where(road_grid.road_mask > 0))
+            if len(road_coords) > 0:
+                # Estimate segments by checking spread
+                y_spread = road_coords[:, 0].max() - road_coords[:, 0].min()
+                x_spread = road_coords[:, 1].max() - road_coords[:, 1].min()
+                # If road is spread in both directions, might be intersection
+                features['road_segments_count'] = 1
+                features['is_intersection'] = 1.0 if (y_spread > h * 0.3 and x_spread > w * 0.3) else 0.0
+            else:
+                features['road_segments_count'] = 0
+                features['is_intersection'] = 0.0
+    else:
+        features['road_segments_count'] = 0
+        features['is_intersection'] = 0.0
+    
+    # 5. Image quality (blur and brightness)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Blur detection using Laplacian variance
+    blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+    features['image_blur_score'] = blur_score / 1000.0  # Normalize
+    
+    # Brightness
+    brightness = np.mean(gray) / 255.0
+    features['image_brightness'] = brightness
+    
+    return features
+
+
+def extract_multiscale_features(person_bbox, road_grid, image_shape):
+    """
+    Extract features at multiple spatial scales
+    
+    Args:
+        person_bbox: (x1, y1, x2, y2) person bounding box
+        road_grid: RoadGrid instance
+        image_shape: (height, width)
+    
+    Returns:
+        dict with multi-scale features
+    """
+    features = {}
+    h, w = image_shape
+    p_center = ((person_bbox[0] + person_bbox[2]) / 2, (person_bbox[1] + person_bbox[3]) / 2)
+    
+    # 1. Local context (immediate area around person - 50 pixels)
+    local_radius = 50
+    local_x_min = max(0, int(p_center[0] - local_radius))
+    local_y_min = max(0, int(p_center[1] - local_radius))
+    local_x_max = min(w, int(p_center[0] + local_radius))
+    local_y_max = min(h, int(p_center[1] + local_radius))
+    
+    if road_grid.road_mask is not None:
+        local_road_area = np.sum(
+            road_grid.road_mask[local_y_min:local_y_max, local_x_min:local_x_max] > 0
+        )
+        local_area = (local_x_max - local_x_min) * (local_y_max - local_y_min)
+        features['local_road_ratio'] = local_road_area / (local_area + 1e-6)
+    else:
+        features['local_road_ratio'] = 0.0
+    
+    # 2. Regional context (medium area - 150 pixels)
+    regional_radius = 150
+    regional_x_min = max(0, int(p_center[0] - regional_radius))
+    regional_y_min = max(0, int(p_center[1] - regional_radius))
+    regional_x_max = min(w, int(p_center[0] + regional_radius))
+    regional_y_max = min(h, int(p_center[1] + regional_radius))
+    
+    if road_grid.road_mask is not None:
+        regional_road_area = np.sum(
+            road_grid.road_mask[regional_y_min:regional_y_max, regional_x_min:regional_x_max] > 0
+        )
+        regional_area = (regional_x_max - regional_x_min) * (regional_y_max - regional_y_min)
+        features['regional_road_ratio'] = regional_road_area / (regional_area + 1e-6)
+    else:
+        features['regional_road_ratio'] = 0.0
+    
+    # 3. Global context (entire image)
+    if road_grid.road_mask is not None:
+        global_road_area = np.sum(road_grid.road_mask > 0)
+        global_area = h * w
+        features['global_road_ratio'] = global_road_area / global_area
+    else:
+        features['global_road_ratio'] = 0.0
+    
+    # 4. Distance to image boundaries (edge effects)
+    features['distance_to_left_edge'] = person_bbox[0] / w
+    features['distance_to_right_edge'] = (w - person_bbox[2]) / w
+    features['distance_to_top_edge'] = person_bbox[1] / h
+    features['distance_to_bottom_edge'] = (h - person_bbox[3]) / h
+    
+    # 5. Position in image (normalized)
+    features['position_x_norm'] = p_center[0] / w
+    features['position_y_norm'] = p_center[1] / h
+    
+    return features
+
+
+def compute_conflict_risk(person_center, pose_data, road_grid, pose_analyzer, bbox=None):
+    """
+    ENHANCED conflict risk score (0-1) with better category separation
+    
+    Improved Formula for Better LOW/MED/HIGH Separation:
+    1. Position: Bounding box inside trapezoid? (INCREASED to 0.65 weight - primary risk factor)
+    2. Agreement: Both SegFormer and manual agree on road? (0.10 weight)
+    3. Pose: Body orientation relative to road? (DECREASED to 0.25 weight - less strict)
+    
+    Key Improvements:
+    - Higher weight on position (being in road = primary risk)
+    - Better pose scoring for perpendicular angles (crossing behavior)
+    - Non-linear transformation for clearer category boundaries
+    
+    Args:
+        person_center: (x, y) center point of person
+        pose_data: Pose data from MediaPipe
+        road_grid: RoadGrid instance
+        pose_analyzer: PoseAnalyzer instance
+        bbox: Optional bounding box (x1, y1, x2, y2) for more accurate position check
     """
     x, y = person_center
     conflict_score = 0.0
     
+    # Check if bounding box is inside trapezoid (more accurate than just center point)
+    bbox_inside_manual = False
+    bbox_inside_segformer = False
+    
+    if bbox is not None:
+        x1, y1, x2, y2 = bbox
+        # Check if bbox corners are inside trapezoid
+        bbox_corners = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        bbox_center = ((x1 + x2) / 2, (y1 + y2) / 2)
+        
+        # Count how many corners are inside manual trapezoid
+        corners_inside_manual = sum(1 for corner in bbox_corners 
+                                    if road_grid.is_in_street(corner[0], corner[1], use_segformer=False))
+        # If majority of corners or center is inside, consider bbox inside
+        bbox_inside_manual = (corners_inside_manual >= 2 or 
+                             road_grid.is_in_street(bbox_center[0], bbox_center[1], use_segformer=False))
+        
+        # Same for SegFormer
+        corners_inside_segformer = sum(1 for corner in bbox_corners 
+                                      if road_grid.is_in_street(corner[0], corner[1], use_segformer=True))
+        bbox_inside_segformer = (corners_inside_segformer >= 2 or 
+                                road_grid.is_in_street(bbox_center[0], bbox_center[1], use_segformer=True))
+    
     # Check position in both SegFormer and manual trapezoid (separate features)
     in_segformer, in_manual = road_grid.is_in_street_both(x, y)
     
-    # Factor 1: Position-based risk (0.4 weight)
+    # Use bbox check if available (more accurate)
+    if bbox is not None:
+        in_manual = bbox_inside_manual
+        in_segformer = bbox_inside_segformer
+    
+    # Factor 1: Position-based risk - INCREASED WEIGHT (0.65) - Primary risk factor
     position_score = 0.0
     distance_score_segformer = 0.0
     distance_score_manual = 0.0
     
-    if in_segformer:
-        # In SegFormer-detected road
-        distance_to_road = road_grid.get_distance_to_road(x, y)
-        if distance_to_road != float('inf'):
-            distance_score_segformer = distance_to_road
-        else:
-            grid_row, grid_col = road_grid.get_grid_cell(x, y)
-            distance_score_segformer = grid_row / road_grid.grid_rows if road_grid.grid_rows > 0 else 0.5
-        position_score += 0.2 * distance_score_segformer  # 0.2 weight for SegFormer
-    
+    # ENHANCED: Higher base scores for being inside trapezoid
     if in_manual:
-        # In manual trapezoid
         if road_grid.manual_trapezoid_mask is not None:
-            # Compute distance in manual trapezoid
+            # Compute distance/proximity in manual trapezoid
             _, y_min, _, y_max = road_grid._get_trapezoid_bbox(road_grid.manual_trapezoid)
             road_height = y_max - y_min
             if road_height > 0:
-                distance_score_manual = (y - y_min) / road_height  # 0=top, 1=bottom
+                # Closer to bottom (camera) = higher risk
+                distance_score_manual = (y - y_min) / road_height  # 0=top (far), 1=bottom (near)
+            else:
+                distance_score_manual = 1.0  # Default high score if inside
         else:
             grid_row, grid_col = road_grid.get_grid_cell(x, y)
             distance_score_manual = grid_row / road_grid.grid_rows if road_grid.grid_rows > 0 else 0.5
-        position_score += 0.2 * distance_score_manual  # 0.2 weight for manual
+        
+        # IMPROVED: Higher base score for being inside (0.85-1.0 range, was 0.8-1.0)
+        if bbox is not None and bbox_inside_manual:
+            position_score = 0.85 + 0.15 * distance_score_manual  # 0.85-1.0 if inside
+        else:
+            position_score = 0.65 + 0.2 * distance_score_manual  # 0.65-0.85 if center inside but bbox not fully
+    else:
+        # Outside trapezoid - very low score
+        position_score = 0.0
     
-    # Factor 2: Agreement between SegFormer and manual (0.1 weight)
+    # Also consider SegFormer road (lower weight)
+    if in_segformer:
+        distance_to_road = road_grid.get_distance_to_road(x, y)
+        if distance_to_road != float('inf'):
+            distance_score_segformer = min(1.0, distance_to_road)
+        else:
+            grid_row, grid_col = road_grid.get_grid_cell(x, y)
+            distance_score_segformer = grid_row / road_grid.grid_rows if road_grid.grid_rows > 0 else 0.5
+        # Add SegFormer contribution (smaller weight)
+        position_score = max(position_score, 0.15 * distance_score_segformer)
+    
+    # Factor 2: Agreement between SegFormer and manual (0.10 weight - unchanged)
     agreement_score = 0.0
     if in_segformer and in_manual:
         agreement_score = 1.0  # Both agree person is in road
@@ -702,7 +1281,8 @@ def compute_conflict_risk(person_center, pose_data, road_grid, pose_analyzer):
     else:
         agreement_score = 0.5  # Disagreement
     
-    conflict_score += 0.4 * position_score + 0.1 * agreement_score
+    # ENHANCED: Increased position weight, decreased pose weight
+    conflict_score += 0.65 * position_score + 0.10 * agreement_score
     
     # Determine position type
     if in_segformer and in_manual:
@@ -716,7 +1296,8 @@ def compute_conflict_risk(person_center, pose_data, road_grid, pose_analyzer):
     else:
         position_type = "outside"
     
-    # Factor 3: Pose inclination (0.5 weight)
+    # Factor 3: Pose inclination - DECREASED WEIGHT (0.25) and IMPROVED scoring
+    # Key improvement: Perpendicular angles (60-120°) are HIGH RISK (crossing behavior!)
     pose_score = 0.0
     angle_to_street_segformer = None
     angle_to_street_manual = None
@@ -726,19 +1307,7 @@ def compute_conflict_risk(person_center, pose_data, road_grid, pose_analyzer):
         body_orientation = pose_analyzer.compute_body_orientation(pose_data)
         
         if body_orientation:
-            # Compute angle to SegFormer road center
-            if road_grid.road_mask is not None:
-                segformer_center = road_grid.get_street_center()
-                to_segformer = (segformer_center[0] - x, segformer_center[1] - y)
-                to_segformer_mag = math.sqrt(to_segformer[0]**2 + to_segformer[1]**2)
-                if to_segformer_mag > 0:
-                    to_segformer = (to_segformer[0] / to_segformer_mag, to_segformer[1] / to_segformer_mag)
-                    body_vec = body_orientation['vector']
-                    dot_product = body_vec[0] * to_segformer[0] + body_vec[1] * to_segformer[1]
-                    angle_rad = math.acos(max(-1, min(1, dot_product)))
-                    angle_to_street_segformer = math.degrees(angle_rad)
-            
-            # Compute angle to manual trapezoid center
+            # Prioritize manual trapezoid for pose inclination
             if road_grid.manual_trapezoid:
                 manual_center = road_grid._get_trapezoid_center(road_grid.manual_trapezoid)
                 to_manual = (manual_center[0] - x, manual_center[1] - y)
@@ -749,29 +1318,54 @@ def compute_conflict_risk(person_center, pose_data, road_grid, pose_analyzer):
                     dot_product = body_vec[0] * to_manual[0] + body_vec[1] * to_manual[1]
                     angle_rad = math.acos(max(-1, min(1, dot_product)))
                     angle_to_street_manual = math.degrees(angle_rad)
+                    
+                    # ENHANCED: Better scoring for perpendicular angles (crossing = high risk!)
+                    # Perpendicular crossing (60-120°) is HIGH RISK, not medium!
+                    if angle_to_street_manual <= 45:
+                        # Facing towards (0-45°) - HIGH RISK
+                        pose_score = 1.0 - (angle_to_street_manual / 45.0) * 0.2  # 0.8-1.0
+                    elif angle_to_street_manual <= 90:
+                        # Perpendicular (45-90°) - HIGH RISK (crossing behavior!)
+                        pose_score = 0.8 - ((angle_to_street_manual - 45) / 45.0) * 0.3  # 0.5-0.8
+                    elif angle_to_street_manual <= 135:
+                        # Slightly away (90-135°) - MEDIUM RISK
+                        pose_score = 0.5 - ((angle_to_street_manual - 90) / 45.0) * 0.3  # 0.2-0.5
+                    else:
+                        # Facing away (135-180°) - LOW RISK
+                        pose_score = 0.2 - ((angle_to_street_manual - 135) / 45.0) * 0.2  # 0.0-0.2
+                    pose_score = max(0.0, min(1.0, pose_score))
             
-            # Use average angle if both available, otherwise use available one
-            if angle_to_street_segformer is not None and angle_to_street_manual is not None:
-                angle_to_street = (angle_to_street_segformer + angle_to_street_manual) / 2
-            elif angle_to_street_segformer is not None:
-                angle_to_street = angle_to_street_segformer
-            elif angle_to_street_manual is not None:
-                angle_to_street = angle_to_street_manual
-            else:
-                angle_to_street = None
-            
-            if angle_to_street is not None:
-                if angle_to_street < 45:
-                    pose_score = 1.0 - (angle_to_street / 45.0)
-                elif angle_to_street > 135:
-                    pose_score = 0.0
-                else:
-                    pose_score = 0.5 - ((angle_to_street - 45) / 90.0) * 0.5
+            # Also compute for SegFormer (for reference)
+            if road_grid.road_mask is not None:
+                segformer_center = road_grid.get_street_center()
+                to_segformer = (segformer_center[0] - x, segformer_center[1] - y)
+                to_segformer_mag = math.sqrt(to_segformer[0]**2 + to_segformer[1]**2)
+                if to_segformer_mag > 0:
+                    to_segformer = (to_segformer[0] / to_segformer_mag, to_segformer[1] / to_segformer_mag)
+                    body_vec = body_orientation['vector']
+                    dot_product = body_vec[0] * to_segformer[0] + body_vec[1] * to_segformer[1]
+                    angle_rad = math.acos(max(-1, min(1, dot_product)))
+                    angle_to_street_segformer = math.degrees(angle_rad)
         
-        conflict_score += 0.5 * pose_score
+        # DECREASED weight from 0.4 to 0.25 (position is more important)
+        conflict_score += 0.25 * pose_score
+    
+    # NON-LINEAR TRANSFORMATION for better category separation
+    # This creates clearer boundaries between LOW/MED/HIGH
+    raw_score = min(1.0, conflict_score)
+    
+    # Transform: compress low scores, expand high scores for better separation
+    if raw_score < 0.5:
+        # Compress low scores (make LOW more distinct)
+        # Maps [0, 0.5] -> [0, 0.4] with power transformation
+        transformed_score = (raw_score / 0.5) ** 1.5 * 0.4
+    else:
+        # Expand high scores (make HIGH more distinct)
+        # Maps [0.5, 1.0] -> [0.4, 1.0] with power transformation
+        transformed_score = 0.4 + ((raw_score - 0.5) / 0.5) ** 0.7 * 0.6
     
     return {
-        'conflict_score': min(1.0, conflict_score),
+        'conflict_score': min(1.0, max(0.0, transformed_score)),
         'position_type': position_type,
         'in_segformer': in_segformer,
         'in_manual': in_manual,
@@ -825,16 +1419,18 @@ def load_yolo_bboxes(label_path, image_width=640, image_height=640, class_id=0):
     return bboxes
 
 
-def visualize_conflict_risk(image_path, person_bboxes, 
-                           calibration_file=None, use_road_detector=True):
+def visualize_conflict_risk(image_path, person_bboxes=None, 
+                           calibration_file=None, use_road_detector=True,
+                           yolo_model_path=None):
     """
     Visualize conflict risk assessment on a single image using SegFormer road detection
     
     Args:
         image_path: Path to image file
-        person_bboxes: List of bounding boxes [(x1, y1, x2, y2), ...]
+        person_bboxes: List of bounding boxes [(x1, y1, x2, y2), ...] (optional, will use YOLO if not provided)
         calibration_file: Path to calibration JSON file (optional, for backward compatibility)
         use_road_detector: Whether to use SegFormer for automatic road detection (default: True)
+        yolo_model_path: Path to YOLO model for person detection (optional, will auto-detect if not provided)
     """
     # Load image
     image = cv2.imread(str(image_path))
@@ -851,18 +1447,31 @@ def visualize_conflict_risk(image_path, person_bboxes,
     sidewalk_mask = None
     segformer_detected = False
     
+    segformer_confidence = None
     if use_road_detector and ROAD_DETECTOR_AVAILABLE:
         try:
             from road_detector import RoadDetector
-            print("Detecting road region with SegFormer...")
+            print("Detecting road region with SegFormer (with fusion)...")
             detector = RoadDetector()
-            road_mask, road_polygon, sidewalk_mask = detector.detect_road(image)
+            
+            # Get full segmentation with confidence
+            result = detector.detect_road(image, return_full_segmentation=True)
+            if len(result) == 5:
+                road_mask, road_polygon, sidewalk_mask, full_segmentation, class_info = result
+                # Extract confidence map from class_info
+                if 'confidence_map' in class_info:
+                    segformer_confidence = class_info['confidence_map']
+                    print(f"✓ SegFormer confidence map extracted: {segformer_confidence.shape}")
+            else:
+                road_mask, road_polygon, sidewalk_mask = result
             
             if road_mask is not None and road_polygon:
                 print(f"✓ SegFormer road region detected: {len(road_polygon)} polygon points")
                 print(f"  Road pixels: {(road_mask > 0).sum()}")
                 if sidewalk_mask is not None:
                     print(f"  Sidewalk pixels: {(sidewalk_mask > 0).sum()}")
+                if segformer_confidence is not None:
+                    print(f"  Avg confidence: {segformer_confidence.mean():.3f}")
                 segformer_detected = True
             else:
                 print("⚠ SegFormer road detection failed, using calibration/default")
@@ -873,7 +1482,7 @@ def visualize_conflict_risk(image_path, person_bboxes,
             traceback.print_exc()
             use_road_detector = False
     
-    # Initialize road grid with SegFormer results AND calibration (both for comparison)
+    # Initialize road grid with SegFormer results AND calibration (fusion enabled by default)
     if segformer_detected and road_mask is not None:
         road_grid = RoadGrid(
             img_width=w, 
@@ -881,30 +1490,118 @@ def visualize_conflict_risk(image_path, person_bboxes,
             road_mask=road_mask,
             road_polygon=road_polygon,
             sidewalk_mask=sidewalk_mask,
-            calibration_file=calibration_file  # Also load manual trapezoid if available
+            calibration_file=calibration_file,  # Also load manual trapezoid if available
+            use_fusion=True,  # Enable state-of-the-art fusion
+            segformer_confidence=segformer_confidence  # Pass confidence for fusion
         )
+        
+        # Print fusion statistics if available
+        if road_grid.fusion_result is not None:
+            from multimodal_road_fusion import MultiModalRoadFusion
+            fusion_module = MultiModalRoadFusion()
+            stats = fusion_module.get_fusion_statistics(road_grid.fusion_result)
+            print(f"\n✓ Multi-Modal Fusion Statistics:")
+            print(f"  Agreement: {stats['avg_agreement']:.3f}")
+            print(f"  Confidence: {stats['avg_confidence']:.3f}")
+            print(f"  Uncertainty: {stats['avg_uncertainty']:.3f}")
+            print(f"  Fusion strategy: {stats['strategy_distribution']}")
     else:
         # Fallback to calibration file or default
         road_grid = RoadGrid(img_width=w, img_height=h, calibration_file=calibration_file)
+    
+    # Step 1: Get person bounding boxes (use YOLO if not provided)
+    if person_bboxes is None or len(person_bboxes) == 0:
+        # Use YOLO to detect people
+        yolo_model = None
+        if YOLO_AVAILABLE:
+            try:
+                if yolo_model_path:
+                    yolo_path = Path(yolo_model_path)
+                    if yolo_path.exists():
+                        yolo_model = YOLO(str(yolo_path))
+                        print(f"✓ YOLO model loaded from: {yolo_path}")
+                    else:
+                        print(f"⚠ YOLO model not found: {yolo_path}, using default YOLO12n")
+                        yolo_model = YOLO('yolo12n.pt')  # Use default YOLO12n
+                        print(f"✓ Using default YOLO12n model")
+                else:
+                    # Use default YOLO12n (pre-trained on COCO, includes person class)
+                    yolo_model = YOLO('yolo12n.pt')
+                    print(f"✓ Using default YOLO12n model for person detection")
+            except Exception as e:
+                print(f"⚠ YOLO model initialization failed: {e}")
+        
+        # Detect available device (MPS for Apple Silicon, CUDA for NVIDIA, CPU fallback)
+        device = 'cpu'  # Default device
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                device = 'mps'
+                print(f"✓ Apple MPS GPU detected")
+            elif torch.cuda.is_available():
+                device = '0'
+                print(f"✓ CUDA GPU detected: {torch.cuda.get_device_name(0)}")
+            else:
+                device = 'cpu'
+                print("⚠ No GPU available, using CPU")
+        except ImportError:
+            device = 'cpu'
+            print("⚠ PyTorch not available, using CPU")
+        
+        if yolo_model:
+            try:
+                # Run YOLO detection with GPU support (MPS for Apple, CUDA for NVIDIA, CPU fallback)
+                results = yolo_model(image, conf=0.25, iou=0.45, verbose=False, device=device)
+                
+                # Extract person bounding boxes
+                person_bboxes = []
+                for result in results:
+                    boxes = result.boxes
+                    if boxes is not None:
+                        for box in boxes:
+                            cls = int(box.cls[0])
+                            class_name = yolo_model.names[cls] if hasattr(yolo_model, 'names') else ''
+                            
+                            # Accept if class is 0 (person) or name contains 'person'
+                            if cls == 0 or 'person' in class_name.lower():
+                                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                conf = float(box.conf[0])
+                                
+                                if conf > 0.25:
+                                    person_bboxes.append((float(x1), float(y1), float(x2), float(y2)))
+                
+                print(f"✓ YOLO detected {len(person_bboxes)} person(s)")
+            except Exception as e:
+                print(f"⚠ YOLO detection failed: {e}")
+                person_bboxes = []
+        else:
+            print("⚠ No YOLO model available and no person_bboxes provided")
+            person_bboxes = []
+    
+    if not person_bboxes:
+        print("⚠ No person bounding boxes found. Cannot compute conflict risk.")
+        return
     
     # Initialize pose analyzer and human segmenter
     pose_analyzer = PoseAnalyzer()
     human_segmenter = HumanSegmenter()
     
-    # Process each person
+    # Step 2: For each person bbox, crop and run MediaPipe pose (YOLO → crop → MediaPipe)
+    # This is the best practice approach: crop each person and run MediaPipe pose on the crop
     results = []
     for i, bbox in enumerate(person_bboxes):
         x1, y1, x2, y2 = bbox
         person_center = ((x1 + x2) / 2, (y1 + y2) / 2)
         
-        # Extract pose
+        # Extract pose from bbox using YOLO → crop → MediaPipe approach
+        # This crops the person, runs MediaPipe pose on the crop, then maps landmarks back
         pose_data = pose_analyzer.extract_pose(image, bbox)
         
         # Segment person (aligned with pose)
         segmentation_mask = human_segmenter.segment_person(image, bbox, pose_data)
         
-        # Compute conflict risk
-        risk_data = compute_conflict_risk(person_center, pose_data, road_grid, pose_analyzer)
+        # Compute conflict risk (pass bbox for more accurate position check)
+        risk_data = compute_conflict_risk(person_center, pose_data, road_grid, pose_analyzer, bbox=bbox)
         
         results.append({
             'person_id': i,
@@ -914,6 +1611,8 @@ def visualize_conflict_risk(image_path, person_bboxes,
             'segmentation_mask': segmentation_mask,
             'risk_data': risk_data
         })
+    
+    print(f"✓ Processed {len(results)} person(s) with YOLO → crop → MediaPipe approach")
     
     # Create visualization
     fig, ax = plt.subplots(1, 1, figsize=(12, 12))
@@ -1002,7 +1701,7 @@ def visualize_conflict_risk(image_path, person_bboxes,
         x = x_min + j * road_grid.cell_width
         ax.axvline(x, color='gray', linestyle=':', alpha=0.3, linewidth=0.5)
     
-    # Draw each person
+    # Draw each person from bounding boxes
     for result in results:
         bbox = result['bbox']
         person_center = result['center']
@@ -1040,15 +1739,57 @@ def visualize_conflict_risk(image_path, person_bboxes,
             seg_overlay[:, :, 3] = seg_mask_bool.astype(np.float32) * 0.4  # Alpha
             ax.imshow(seg_overlay, extent=[0, w, h, 0], alpha=0.4)
         
-        # Draw bounding box
+        # Draw bounding box with thicker line for visibility
         rect = Rectangle((x1, y1), x2 - x1, y2 - y1,
-                        fill=False, edgecolor=color, linewidth=3)
+                        fill=False, edgecolor=color, linewidth=4)
         ax.add_patch(rect)
         
-        # Draw pose landmarks if available
+        # Draw conflict score prominently on bounding box (always in red)
+        score_text = f"Risk: {conflict_score:.2f} ({risk_level})"
+        ax.text(x1, y1 - 8, score_text, 
+               color='red', fontsize=13, fontweight='bold',
+               bbox=dict(boxstyle='round,pad=0.6', facecolor='white', 
+                        edgecolor='red', linewidth=3, alpha=0.95))
+        
+        # Draw pose landmarks if available (ALWAYS draw if pose is detected)
         if pose_data and pose_analyzer.mp_pose:
             landmarks = pose_data['landmarks']
             mp_pose = pose_analyzer.mp_pose
+            
+            # Draw pose connections (skeleton)
+            pose_connections = [
+                # Face
+                (mp_pose.PoseLandmark.LEFT_EYE, mp_pose.PoseLandmark.RIGHT_EYE),
+                (mp_pose.PoseLandmark.LEFT_EYE, mp_pose.PoseLandmark.NOSE),
+                (mp_pose.PoseLandmark.RIGHT_EYE, mp_pose.PoseLandmark.NOSE),
+                # Torso
+                (mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.RIGHT_SHOULDER),
+                (mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.LEFT_HIP),
+                (mp_pose.PoseLandmark.RIGHT_SHOULDER, mp_pose.PoseLandmark.RIGHT_HIP),
+                (mp_pose.PoseLandmark.LEFT_HIP, mp_pose.PoseLandmark.RIGHT_HIP),
+                # Left arm
+                (mp_pose.PoseLandmark.LEFT_SHOULDER, mp_pose.PoseLandmark.LEFT_ELBOW),
+                (mp_pose.PoseLandmark.LEFT_ELBOW, mp_pose.PoseLandmark.LEFT_WRIST),
+                # Right arm
+                (mp_pose.PoseLandmark.RIGHT_SHOULDER, mp_pose.PoseLandmark.RIGHT_ELBOW),
+                (mp_pose.PoseLandmark.RIGHT_ELBOW, mp_pose.PoseLandmark.RIGHT_WRIST),
+                # Left leg
+                (mp_pose.PoseLandmark.LEFT_HIP, mp_pose.PoseLandmark.LEFT_KNEE),
+                (mp_pose.PoseLandmark.LEFT_KNEE, mp_pose.PoseLandmark.LEFT_ANKLE),
+                # Right leg
+                (mp_pose.PoseLandmark.RIGHT_HIP, mp_pose.PoseLandmark.RIGHT_KNEE),
+                (mp_pose.PoseLandmark.RIGHT_KNEE, mp_pose.PoseLandmark.RIGHT_ANKLE),
+            ]
+            
+            # Draw connections
+            for connection in pose_connections:
+                start_landmark, end_landmark = connection
+                if start_landmark in landmarks and end_landmark in landmarks:
+                    start = landmarks[start_landmark]
+                    end = landmarks[end_landmark]
+                    if start['visibility'] > 0.3 and end['visibility'] > 0.3:
+                        ax.plot([start['x'], end['x']], [start['y'], end['y']], 
+                               color=color, linewidth=2, alpha=0.7)
             
             # Draw key points
             key_points = [
@@ -1064,8 +1805,8 @@ def visualize_conflict_risk(image_path, person_bboxes,
             for landmark in key_points:
                 if landmark in landmarks:
                     lm = landmarks[landmark]
-                    if lm['visibility'] > 0.5:
-                        ax.plot(lm['x'], lm['y'], 'o', color=color, markersize=6)
+                    if lm['visibility'] > 0.3:
+                        ax.plot(lm['x'], lm['y'], 'o', color=color, markersize=6, markeredgecolor='black', markeredgewidth=1)
             
             # Draw body orientation vector
             body_orientation = risk_data.get('body_orientation')
@@ -1084,7 +1825,7 @@ def visualize_conflict_risk(image_path, person_bboxes,
                         (street_center[1] - person_center[1]) * 0.3,
                         head_width=8, head_length=8, fc='yellow', ec='yellow', 
                         linestyle='--', alpha=0.5)
-        
+    
         # Add text annotation with both SegFormer and manual parameters
         grid_row, grid_col = road_grid.get_grid_cell(person_center[0], person_center[1])
         
@@ -1121,7 +1862,7 @@ def visualize_conflict_risk(image_path, person_bboxes,
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f"✓ Visualization saved to: {output_path}")
     
-    # Print summary
+    # Print summary with both SegFormer and manual parameters
     print("\n" + "="*60)
     print("CONFLICT RISK ASSESSMENT SUMMARY")
     print("="*60)
@@ -1130,11 +1871,18 @@ def visualize_conflict_risk(image_path, person_bboxes,
         print(f"\nPerson {result['person_id']+1}:")
         print(f"  Conflict Score: {risk['conflict_score']:.3f}")
         print(f"  Position: {risk['position_type']}")
-        if risk['position_type'] == 'street':
-            print(f"  Distance Score: {risk['distance_score']:.3f}")
+        print(f"    - In SegFormer road: {risk.get('in_segformer', False)}")
+        print(f"    - In Manual trapezoid: {risk.get('in_manual', False)}")
+        print(f"    - Agreement: {risk.get('agreement_score', 0):.3f}")
+        if risk.get('distance_score_segformer', 0) > 0:
+            print(f"  SegFormer Distance Score: {risk['distance_score_segformer']:.3f}")
+        if risk.get('distance_score_manual', 0) > 0:
+            print(f"  Manual Distance Score: {risk['distance_score_manual']:.3f}")
         print(f"  Pose Score: {risk['pose_score']:.3f}")
-        if risk['angle_to_street']:
-            print(f"  Angle to Street: {risk['angle_to_street']:.1f}°")
+        if risk.get('angle_to_street_segformer') is not None:
+            print(f"  Angle to SegFormer road: {risk['angle_to_street_segformer']:.1f}°")
+        if risk.get('angle_to_street_manual') is not None:
+            print(f"  Angle to Manual trapezoid: {risk['angle_to_street_manual']:.1f}°")
     print("="*60)
     
     plt.show()
@@ -1150,27 +1898,32 @@ if __name__ == "__main__":
     # Set use_road_detector=False and provide calibration_file for manual calibration
     use_road_detector = True  # Use SegFormer for automatic road detection
     
+    # Optional: Use custom YOLO model (set to None to use default YOLO12n)
+    yolo_model_path = None  # Set to Path("best_500 image.pt") if you want to use custom model
+    
     # Optional: Load calibration from JSON file (for backward compatibility)
     calibration_file = image_path.parent.parent / "grid_calibration.json"
     if not calibration_file.exists():
         calibration_file = None
     
-    # Load bounding boxes from YOLO label file (recommended)
-    label_path = image_path.parent.parent.parent / "labels" / "train" / f"{image_path.stem}.txt"
-    person_bboxes = load_yolo_bboxes(label_path, image_width=640, image_height=640, class_id=0)
+    # Option 1: Use YOLO to automatically detect people (recommended)
+    # Set person_bboxes=None to use YOLO detection
+    person_bboxes = None
     
-    # Alternative: Define bounding boxes manually
+    # Option 2: Load bounding boxes from YOLO label file
+    # label_path = image_path.parent.parent.parent / "labels" / "train" / f"{image_path.stem}.txt"
+    # person_bboxes = load_yolo_bboxes(label_path, image_width=640, image_height=640, class_id=0)
+    
+    # Option 3: Define bounding boxes manually
     # person_bboxes = [
     #     (200, 300, 350, 550),  # Person 1
     #     (400, 250, 550, 500),  # Person 2
     # ]
     
-    if not person_bboxes:
-        print("No person bounding boxes found. Please check the label file or define manually.")
-    else:
-        print(f"Found {len(person_bboxes)} person(s) in the image")
-        print("Using SegFormer for road detection...")
-        visualize_conflict_risk(image_path, person_bboxes, 
-                               calibration_file=calibration_file,
-                               use_road_detector=use_road_detector)
+    print("Using YOLO12n (default) → crop → MediaPipe approach for pose detection...")
+    print("Using SegFormer for road detection...")
+    visualize_conflict_risk(image_path, person_bboxes=person_bboxes, 
+                           calibration_file=calibration_file,
+                           use_road_detector=use_road_detector,
+                           yolo_model_path=yolo_model_path)
 

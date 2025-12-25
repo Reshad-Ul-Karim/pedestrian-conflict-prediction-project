@@ -8,6 +8,16 @@ import cv2
 import numpy as np
 from pathlib import Path
 import json
+import warnings
+import logging
+import os
+
+# Suppress MediaPipe warnings about NORM_RECT
+# MediaPipe uses glog (C++ logging), so we must set env vars BEFORE importing MediaPipe
+# Note: MediaPipe uses CPU (GPU is only for YOLO and SegFormer)
+os.environ['GLOG_minloglevel'] = '2'  # Only show ERROR and FATAL (0=INFO, 1=WARNING, 2=ERROR)
+logging.getLogger().setLevel(logging.ERROR)
+warnings.filterwarnings('ignore', category=UserWarning)
 
 # Try to import MediaPipe
 MP_AVAILABLE = False
@@ -49,6 +59,22 @@ except ImportError:
     ROAD_DETECTOR_AVAILABLE = False
     print("Warning: Road detector not available. Install transformers: pip install transformers")
 
+# Import YOLO for person detection
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("Warning: YOLO not available. Install ultralytics: pip install ultralytics")
+
+# Import conflict risk computation from visualize_conflict_risk
+try:
+    from visualize_conflict_risk import RoadGrid, PoseAnalyzer, compute_conflict_risk
+    CONFLICT_RISK_AVAILABLE = True
+except ImportError:
+    CONFLICT_RISK_AVAILABLE = False
+    print("Note: Conflict risk computation not available. Install dependencies.")
+
 
 class HumanSegmenter:
     """Human segmentation using MediaPipe, aligned with pose landmarks"""
@@ -67,6 +93,7 @@ class HumanSegmenter:
                 model_selection=1  # Landscape mode for dashcam
             )
             self.mp_pose = mp.solutions.pose
+            # MediaPipe uses CPU (GPU is only for YOLO and SegFormer)
             self.pose = self.mp_pose.Pose(
                 model_complexity=1,
                 min_detection_confidence=0.5,
@@ -106,7 +133,7 @@ class HumanSegmenter:
         
         # Get segmentation
         results = self.selfie_segmentation.process(person_rgb)
-        if not results.segmentation_mask:
+        if not results or not hasattr(results, 'segmentation_mask') or results.segmentation_mask is None:
             return None
         
         # Get pose for alignment
@@ -172,7 +199,8 @@ class HumanSegmenter:
 class GridCalibrator:
     """Interactive grid calibration with multi-image navigation"""
     
-    def __init__(self, image_dir, grid_rows=8, grid_cols=6, calibration_file=None, use_road_detector=True):
+    def __init__(self, image_dir, grid_rows=12, grid_cols=12, calibration_file=None, 
+                 use_road_detector=True, yolo_model_path=None):
         """
         Initialize calibrator with image directory
         
@@ -182,6 +210,7 @@ class GridCalibrator:
             grid_cols: Number of grid columns
             calibration_file: Path to existing calibration JSON (optional)
             use_road_detector: Whether to use SegFormer for automatic road detection
+            yolo_model_path: Path to YOLO model for person detection (optional)
         """
         self.image_dir = Path(image_dir)
         
@@ -202,6 +231,47 @@ class GridCalibrator:
         self.grid_rows = grid_rows
         self.grid_cols = grid_cols
         
+        # Initialize YOLO model for person detection
+        # Default to YOLO12n if no custom model provided
+        self.yolo_model = None
+        self.device = 'cpu'  # Default device
+        
+        # Detect available device (MPS for Apple Silicon, CUDA for NVIDIA, CPU fallback)
+        try:
+            import torch
+            if torch.backends.mps.is_available():
+                self.device = 'mps'
+                print(f"✓ Apple MPS GPU detected")
+            elif torch.cuda.is_available():
+                self.device = '0'
+                print(f"✓ CUDA GPU detected: {torch.cuda.get_device_name(0)}")
+            else:
+                self.device = 'cpu'
+                print("⚠ No GPU available, using CPU")
+        except ImportError:
+            self.device = 'cpu'
+            print("⚠ PyTorch not available, using CPU")
+        
+        if YOLO_AVAILABLE:
+            try:
+                if yolo_model_path:
+                    yolo_path = Path(yolo_model_path)
+                    if yolo_path.exists():
+                        self.yolo_model = YOLO(str(yolo_path))
+                        print(f"✓ YOLO model loaded from: {yolo_path}")
+                    else:
+                        print(f"⚠ YOLO model not found: {yolo_path}, using default YOLO12n")
+                        self.yolo_model = YOLO('yolo12n.pt')  # Use default YOLO12n
+                        print(f"✓ Using default YOLO12n model")
+                else:
+                    # Use default YOLO12n (pre-trained on COCO, includes person class)
+                    self.yolo_model = YOLO('yolo12n.pt')
+                    print(f"✓ Using default YOLO12n model for person detection")
+            except Exception as e:
+                print(f"⚠ YOLO model initialization failed: {e}")
+        else:
+            print("⚠ YOLO not available. Install ultralytics: pip install ultralytics")
+        
         # Initialize road detector
         self.use_road_detector = use_road_detector and ROAD_DETECTOR_AVAILABLE
         self.road_detector = None
@@ -213,11 +283,17 @@ class GridCalibrator:
                 print(f"⚠ Road detector initialization failed: {e}")
                 self.use_road_detector = False
         
-        # Load calibration if provided, otherwise use defaults
+        # Load calibration if provided, otherwise try to auto-load from image directory
         if calibration_file and Path(calibration_file).exists():
             self.load_calibration(calibration_file)
         else:
-            self.init_default_calibration()
+            # Try to auto-load calibration from image directory
+            auto_calibration_file = self.image_dir / "grid_calibration.json"
+            if auto_calibration_file.exists():
+                print(f"Auto-loading calibration from: {auto_calibration_file}")
+                self.load_calibration(auto_calibration_file)
+            else:
+                self.init_default_calibration()
         
         # Mouse interaction state
         self.dragging = False
@@ -225,15 +301,28 @@ class GridCalibrator:
         self.show_grid = True
         self.edit_mode = True  # Toggle between edit and view mode
         self.show_road_mask = False  # Toggle road mask overlay
-        self.show_full_segmentation = False  # Toggle full SegFormer segmentation
+        self.show_full_segmentation = True  # Toggle full SegFormer segmentation (default: ON)
         self.show_human_segmentation = False  # Toggle human segmentation overlay
-        self.show_pose = False  # Toggle pose visualization
+        self.show_pose = True  # Toggle pose visualization (default: ON)
         
         # Initialize human segmenter (has pose detection built-in)
         self.human_segmenter = HumanSegmenter()
         
         # Store detected poses
         self.detected_poses = []
+        
+        # Store YOLO detections (bboxes) - initialized here, populated in detect_poses()
+        self.yolo_detections = []  # List of {'bbox': (x1, y1, x2, y2), 'conf': confidence, 'person_id': id}
+        
+        # Initialize conflict risk computation components
+        self.road_grid = None  # Will be initialized when image loads
+        self.pose_analyzer = None
+        if CONFLICT_RISK_AVAILABLE:
+            try:
+                self.pose_analyzer = PoseAnalyzer()
+            except Exception as e:
+                print(f"Note: Pose analyzer initialization failed: {e}")
+                self.pose_analyzer = None
         
         # Load first image
         self.load_image(0)
@@ -257,8 +346,8 @@ class GridCalibrator:
         with open(calibration_file, 'r') as f:
             cal = json.load(f)
         
-        self.grid_rows = cal.get('grid_rows', 8)
-        self.grid_cols = cal.get('grid_cols', 6)
+        self.grid_rows = cal.get('grid_rows', 12)
+        self.grid_cols = cal.get('grid_cols', 12)
         # Note: pavement_width is deprecated, using pavement_mask instead
         
         # Load trapezoid points
@@ -313,10 +402,37 @@ class GridCalibrator:
         
         # Store road detection results
         self.road_mask = None
+        self.road_polygon = None  # SegFormer road polygon
         self.sidewalk_mask = None
         self.pavement_mask = None
         self.full_segmentation = None
         self.segmentation_info = None
+        
+        # Auto-detect road with SegFormer on image load (if enabled and available)
+        if self.use_road_detector and self.road_detector:
+            self.auto_detect_road()
+        
+        # Initialize RoadGrid for conflict risk computation (after road detection)
+        if CONFLICT_RISK_AVAILABLE:
+            try:
+                # Create calibration file path for RoadGrid
+                cal_file = self.image_dir / "grid_calibration.json"
+                if not cal_file.exists():
+                    cal_file = None
+                
+                self.road_grid = RoadGrid(
+                    img_width=self.w,
+                    img_height=self.h,
+                    grid_rows=self.grid_rows,
+                    grid_cols=self.grid_cols,
+                    road_mask=self.road_mask,
+                    road_polygon=self.road_polygon,
+                    sidewalk_mask=self.sidewalk_mask,
+                    calibration_file=cal_file
+                )
+            except Exception as e:
+                print(f"Note: RoadGrid initialization failed: {e}")
+                self.road_grid = None
         
         # Detect poses in the image
         self.detect_poses()
@@ -325,42 +441,135 @@ class GridCalibrator:
         return True
     
     def detect_poses(self):
-        """Detect all poses in the current image using MediaPipe"""
+        """
+        Detect all poses using YOLO → crop → MediaPipe approach
+        Best practice: YOLO detects people, then MediaPipe pose on each crop
+        """
         self.detected_poses = []
         
         if not MP_AVAILABLE or not self.human_segmenter or not self.human_segmenter.pose:
             return
         
         try:
-            # Convert to RGB
-            image_rgb = cv2.cvtColor(self.image, cv2.COLOR_BGR2RGB)
+            h, w = self.image.shape[:2]
             
-            # Process full image for pose detection
-            results = self.human_segmenter.pose.process(image_rgb)
+            # Step 1: Use YOLO to detect all people in the image
+            person_bboxes = []
+            self.yolo_detections = []  # Store for visualization
+            if self.yolo_model:
+                try:
+                    # Run YOLO detection with GPU support (MPS for Apple, CUDA for NVIDIA, CPU fallback)
+                    results = self.yolo_model(self.image, conf=0.25, iou=0.45, verbose=False, device=self.device)
+                    
+                    # Extract person bounding boxes (class_id=0 for person in COCO)
+                    for result in results:
+                        boxes = result.boxes
+                        if boxes is not None:
+                            for bbox_idx, box in enumerate(boxes):
+                                # Check if it's a person (class 0) or if class name contains 'person'
+                                cls = int(box.cls[0])
+                                class_name = self.yolo_model.names[cls] if hasattr(self.yolo_model, 'names') else ''
+                                
+                                # Accept if class is 0 (person) or name contains 'person'
+                                if cls == 0 or 'person' in class_name.lower():
+                                    # Get bounding box coordinates (x1, y1, x2, y2)
+                                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                                    conf = float(box.conf[0])
+                                    
+                                    # Only include high-confidence detections
+                                    if conf > 0.25:
+                                        bbox_tuple = (float(x1), float(y1), float(x2), float(y2))
+                                        person_bboxes.append(bbox_tuple)
+                                        
+                                        # Store for visualization
+                                        self.yolo_detections.append({
+                                            'bbox': bbox_tuple,
+                                            'conf': conf,
+                                            'person_id': bbox_idx
+                                        })
+                    
+                    if person_bboxes:
+                        print(f"  YOLO detected {len(person_bboxes)} person(s)")
+                except Exception as e:
+                    print(f"  YOLO detection failed: {e}")
+                    person_bboxes = []
+                    self.yolo_detections = []
             
-            if results.pose_landmarks:
-                # Convert landmarks to image coordinates
-                h, w = self.image.shape[:2]
-                landmarks = {}
-                for landmark in self.human_segmenter.mp_pose.PoseLandmark:
-                    lm = results.pose_landmarks.landmark[landmark.value]
-                    if lm.visibility > 0.3:  # Only include visible landmarks
-                        x = int(lm.x * w)
-                        y = int(lm.y * h)
-                        landmarks[landmark] = {
-                            'x': x,
-                            'y': y,
-                            'z': lm.z,
-                            'visibility': lm.visibility
-                        }
+            # Step 2: For each detected person, crop and run MediaPipe pose
+            for bbox_idx, bbox in enumerate(person_bboxes):
+                x1, y1, x2, y2 = bbox
                 
-                if landmarks:
-                    self.detected_poses.append({
-                        'landmarks': landmarks,
-                        'confidence': np.mean([lm['visibility'] for lm in landmarks.values()])
-                    })
+                # Add padding around bbox for better pose detection
+                padding = 0.2
+                pad_x = int((x2 - x1) * padding)
+                pad_y = int((y2 - y1) * padding)
+                
+                x1_crop = max(0, int(x1) - pad_x)
+                y1_crop = max(0, int(y1) - pad_y)
+                x2_crop = min(w, int(x2) + pad_x)
+                y2_crop = min(h, int(y2) + pad_y)
+                
+                # Crop person from image
+                person_crop = self.image[y1_crop:y2_crop, x1_crop:x2_crop]
+                
+                if person_crop.size == 0:
+                    continue
+                
+                # Convert to RGB for MediaPipe
+                person_rgb = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
+                
+                # Run MediaPipe pose on cropped person
+                pose_results = self.human_segmenter.pose.process(person_rgb)
+                
+                if pose_results and pose_results.pose_landmarks:
+                    # Convert landmarks from crop coordinates to full image coordinates
+                    crop_h, crop_w = person_crop.shape[:2]
+                    landmarks = {}
+                    
+                    for landmark in self.human_segmenter.mp_pose.PoseLandmark:
+                        lm = pose_results.pose_landmarks.landmark[landmark.value]
+                        if lm.visibility > 0.3:  # Only include visible landmarks
+                            # Map from crop coordinates to full image coordinates
+                            x = lm.x * crop_w + x1_crop
+                            y = lm.y * crop_h + y1_crop
+                            
+                            landmarks[landmark] = {
+                                'x': float(x),
+                                'y': float(y),
+                                'z': float(lm.z),
+                                'visibility': float(lm.visibility)
+                            }
+                    
+                    if landmarks:
+                        self.detected_poses.append({
+                            'landmarks': landmarks,
+                            'confidence': np.mean([lm['visibility'] for lm in landmarks.values()]),
+                            'bbox': bbox,  # Store original YOLO bbox
+                            'person_id': bbox_idx
+                        })
+            
+            if self.detected_poses:
+                print(f"  Detected {len(self.detected_poses)} pose(s) using YOLO + MediaPipe")
+            elif not person_bboxes and self.yolo_model:
+                print(f"  YOLO detected {len(person_bboxes)} person(s), but MediaPipe pose extraction failed")
+            
+            # Update RoadGrid with current road detection results
+            if CONFLICT_RISK_AVAILABLE and self.road_grid is not None:
+                try:
+                    # Update road_grid with current road detection
+                    if self.road_mask is not None:
+                        self.road_grid.road_mask = self.road_mask
+                        self.road_grid.road_polygon = self.road_polygon
+                        self.road_grid.sidewalk_mask = self.sidewalk_mask
+                        self.road_grid.pavement_mask = self.pavement_mask
+                        # Recompute road bbox
+                        self.road_grid._compute_road_bbox()
+                except Exception as e:
+                    pass  # Silently fail
+                
         except Exception as e:
             # Silently fail if pose detection fails
+            print(f"  Pose detection error: {e}")
             pass
     
     def auto_detect_road(self):
@@ -376,17 +585,37 @@ class GridCalibrator:
             road_mask, road_polygon, sidewalk_mask, full_segmentation, class_info = result
             
             if road_polygon and len(road_polygon) >= 4:
-                # Update trapezoid points
-                self.trapezoid_points = road_polygon
+                # Store SegFormer polygon separately (don't replace manual trapezoid)
+                # Only update manual trapezoid if it doesn't exist yet
+                if self.trapezoid_points is None:
+                    self.trapezoid_points = road_polygon
                 
-                # Store masks and full segmentation for visualization
-                self.road_mask = road_mask
-                self.sidewalk_mask = sidewalk_mask
+                # Store SegFormer masks and full segmentation (keep separate from manual trapezoid)
+                self.road_mask = road_mask  # SegFormer road mask (separate feature)
+                self.road_polygon = road_polygon  # SegFormer road polygon (separate feature)
+                self.sidewalk_mask = sidewalk_mask  # SegFormer sidewalk mask (separate feature)
                 self.full_segmentation = full_segmentation
                 self.segmentation_info = class_info
                 
                 # Derive pavement mask from SegFormer sidewalk or adjacent areas
                 self.pavement_mask = self._derive_pavement_mask(adjacent_threshold=50)
+                
+                # Update RoadGrid if available
+                if CONFLICT_RISK_AVAILABLE and self.road_grid is not None:
+                    try:
+                        self.road_grid.road_mask = self.road_mask
+                        self.road_grid.road_polygon = self.road_polygon
+                        self.road_grid.sidewalk_mask = self.sidewalk_mask
+                        self.road_grid.pavement_mask = self.pavement_mask
+                        self.road_grid._compute_road_bbox()
+                    except Exception as e:
+                        pass
+                
+                # IMPORTANT: Keep manual trapezoid separate (don't replace it with SegFormer)
+                # Manual trapezoid (self.trapezoid_points) and SegFormer (self.road_polygon) are BOTH kept
+                # Only initialize manual trapezoid if it doesn't exist yet
+                if self.trapezoid_points is None:
+                    self.trapezoid_points = road_polygon  # Use SegFormer as initial manual trapezoid
                 
                 # Print detection statistics
                 if class_info:
@@ -457,28 +686,57 @@ class GridCalibrator:
                 sidewalk_mask_colored[:, :, 0] = self.sidewalk_mask  # Blue channel
                 self.display_image = cv2.addWeighted(self.display_image, 0.7, sidewalk_mask_colored, 0.3, 0)
         
-        # Draw manual trapezoid (street region) - Magenta for manual
-        pts = np.array(self.trapezoid_points, np.int32)
-        pts = pts.reshape((-1, 1, 2))
+        # Draw manual trapezoid (street region) - Magenta for manual (ALWAYS show if exists)
+        if self.trapezoid_points:
+            pts = np.array(self.trapezoid_points, np.int32)
+            pts = pts.reshape((-1, 1, 2))
+            
+            # Create overlay for semi-transparent fill (magenta for manual)
+            overlay = self.display_image.copy()
+            cv2.fillPoly(overlay, [pts], (255, 0, 255))  # Magenta (BGR)
+            cv2.addWeighted(overlay, 0.15, self.display_image, 0.85, 0, self.display_image)
+            cv2.polylines(self.display_image, [pts], True, (255, 0, 255), 3)  # Magenta border (thicker)
+            
+            # Add label for manual trapezoid
+            if len(pts) > 0:
+                top_y = min([p[0][1] for p in pts])
+                top_x = sum([p[0][0] for p in pts]) / len(pts)
+                cv2.putText(self.display_image, "MANUAL TRAPEZOID", 
+                           (int(top_x - 90), int(top_y - 10)),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
         
-        # Create overlay for semi-transparent fill (magenta for manual)
-        overlay = self.display_image.copy()
-        cv2.fillPoly(overlay, [pts], (255, 0, 255))  # Magenta (BGR)
-        cv2.addWeighted(overlay, 0.15, self.display_image, 0.85, 0, self.display_image)
-        cv2.polylines(self.display_image, [pts], True, (255, 0, 255), 2)  # Magenta border
-        
-        # Draw SegFormer road polygon overlay (yellow, dashed) if available
+        # Draw SegFormer road polygon overlay (yellow, dashed) - ALWAYS show if available (separate feature)
         if self.road_mask is not None and self.road_polygon and len(self.road_polygon) >= 4:
             seg_pts = np.array(self.road_polygon, np.int32)
             seg_pts = seg_pts.reshape((-1, 1, 2))
             # Draw as dashed line (approximate with small segments)
-            for i in range(len(seg_pts) - 1):
+            dash_length = 10
+            gap_length = 5
+            for i in range(len(seg_pts)):
                 pt1 = tuple(seg_pts[i][0])
-                pt2 = tuple(seg_pts[i+1][0])
-                cv2.line(self.display_image, pt1, pt2, (0, 255, 255), 2, cv2.LINE_AA)
-            # Close the polygon
-            cv2.line(self.display_image, tuple(seg_pts[-1][0]), tuple(seg_pts[0][0]), 
-                    (0, 255, 255), 2, cv2.LINE_AA)
+                pt2 = tuple(seg_pts[(i+1) % len(seg_pts)][0])
+                # Draw dashed line
+                dx = pt2[0] - pt1[0]
+                dy = pt2[1] - pt1[1]
+                dist = np.sqrt(dx*dx + dy*dy)
+                if dist > 0:
+                    steps = int(dist / (dash_length + gap_length))
+                    for j in range(steps):
+                        start_ratio = j * (dash_length + gap_length) / dist
+                        end_ratio = (j * (dash_length + gap_length) + dash_length) / dist
+                        start_ratio = min(1.0, start_ratio)
+                        end_ratio = min(1.0, end_ratio)
+                        start_pt = (int(pt1[0] + dx * start_ratio), int(pt1[1] + dy * start_ratio))
+                        end_pt = (int(pt1[0] + dx * end_ratio), int(pt1[1] + dy * end_ratio))
+                        cv2.line(self.display_image, start_pt, end_pt, (0, 255, 255), 3, cv2.LINE_AA)
+            
+            # Add label for SegFormer road
+            if len(seg_pts) > 0:
+                top_y = min([p[0][1] for p in seg_pts])
+                top_x = sum([p[0][0] for p in seg_pts]) / len(seg_pts)
+                cv2.putText(self.display_image, "SEGFORMER ROAD", 
+                           (int(top_x - 75), int(top_y - 30)),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         
         # Draw trapezoid corners (only in edit mode)
         if self.edit_mode:
@@ -504,25 +762,112 @@ class GridCalibrator:
                 if len(contour) > 2:
                     cv2.drawContours(self.display_image, [contour], -1, (255, 255, 0), 2, cv2.LINE_AA)
         
+        # Draw YOLO detection bounding boxes with conflict scores (always show if available)
+        if self.yolo_detections:
+            for det in self.yolo_detections:
+                x1, y1, x2, y2 = det['bbox']
+                conf = det['conf']
+                person_id = det['person_id']
+                
+                # Compute conflict risk score
+                conflict_score = 0.0
+                risk_level = "LOW"
+                color = (0, 255, 0)  # Green (low risk)
+                
+                if CONFLICT_RISK_AVAILABLE and self.road_grid is not None and self.pose_analyzer is not None:
+                    try:
+                        # Find corresponding pose data
+                        person_center = ((x1 + x2) / 2, (y1 + y2) / 2)
+                        pose_data = None
+                        for pose_info in self.detected_poses:
+                            if pose_info.get('person_id') == person_id:
+                                pose_data = pose_info
+                                break
+                        
+                        # Compute conflict risk (pass bbox for more accurate position check)
+                        risk_data = compute_conflict_risk(person_center, pose_data, self.road_grid, self.pose_analyzer, bbox=(x1, y1, x2, y2))
+                        conflict_score = risk_data['conflict_score']
+                        
+                        # Determine color and risk level based on conflict score
+                        if conflict_score > 0.7:
+                            color = (0, 0, 255)  # Red (high risk)
+                            risk_level = "HIGH"
+                        elif conflict_score > 0.4:
+                            color = (0, 165, 255)  # Orange (medium risk)
+                            risk_level = "MED"
+                        else:
+                            color = (0, 255, 0)  # Green (low risk)
+                            risk_level = "LOW"
+                    except Exception as e:
+                        # Print error for debugging
+                        print(f"Conflict score computation error for person {person_id+1}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        conflict_score = 0.0
+                
+                # Draw bounding box with color based on conflict score
+                cv2.rectangle(self.display_image, 
+                            (int(x1), int(y1)), (int(x2), int(y2)),
+                            color, 3)  # Thicker line for visibility
+                
+                # Draw conflict score and YOLO confidence
+                # Always show conflict score if road_grid is available, even if score is 0
+                if CONFLICT_RISK_AVAILABLE and self.road_grid is not None:
+                    # Show both conflict score and YOLO confidence
+                    label = f"Risk: {conflict_score:.2f} ({risk_level}) | YOLO: {conf:.2f}"
+                    # White text on red background for visibility
+                    label_color = (255, 255, 255)  # White text (BGR)
+                    bg_color = (0, 0, 255)  # Red background
+                else:
+                    # Fallback: show YOLO confidence only
+                    label = f"Person {person_id+1} | YOLO: {conf:.2f}"
+                    label_color = (255, 255, 255)  # White text
+                    bg_color = color  # Use risk-based color for background
+                
+                label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                # Draw background rectangle for label
+                cv2.rectangle(self.display_image,
+                            (int(x1), int(y1) - label_size[1] - 10),
+                            (int(x1) + label_size[0] + 6, int(y1)),
+                            bg_color, -1)  # Filled background
+                cv2.putText(self.display_image, label,
+                          (int(x1) + 3, int(y1) - 6),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, label_color, 2)  # Bold white text
+        
         # Draw pose visualization if enabled
         if self.show_pose and self.detected_poses:
             self._draw_poses()
         
         # Draw human segmentation if enabled
-        if self.show_human_segmentation and self.human_segmenter.selfie_segmentation:
-            # Try to detect and segment people in the image
-            # For now, we'll use a simple approach - segment the center region
-            # In a full implementation, you'd use a person detector first
-            h_center, w_center = self.h // 2, self.w // 2
-            test_bbox = (w_center - 100, h_center - 150, w_center + 100, h_center + 50)
-            seg_mask = self.human_segmenter.segment_person(self.image, test_bbox)
-            if seg_mask is not None and seg_mask.sum() > 0:
-                overlay = self.display_image.copy()
-                # Create green overlay for human segmentation
-                human_colored = np.zeros_like(overlay)
-                human_colored[:, :, 1] = 255  # Green channel
-                human_colored = cv2.bitwise_and(human_colored, human_colored, mask=seg_mask)
-                cv2.addWeighted(overlay, 0.7, human_colored, 0.3, 0, self.display_image)
+        if self.show_human_segmentation and self.human_segmenter and self.human_segmenter.selfie_segmentation:
+            # Use detected poses to segment people
+            if self.detected_poses:
+                for pose_data in self.detected_poses:
+                    # Get bounding box from pose landmarks
+                    landmarks = pose_data['landmarks']
+                    if landmarks:
+                        xs = [lm['x'] for lm in landmarks.values()]
+                        ys = [lm['y'] for lm in landmarks.values()]
+                        if xs and ys:
+                            x_min, x_max = int(min(xs)), int(max(xs))
+                            y_min, y_max = int(min(ys)), int(max(ys))
+                            # Add padding
+                            padding = 50
+                            bbox = (max(0, x_min - padding), max(0, y_min - padding),
+                                   min(self.w, x_max + padding), min(self.h, y_max + padding))
+                            
+                            try:
+                                seg_mask = self.human_segmenter.segment_person(self.image, bbox)
+                                if seg_mask is not None and seg_mask.sum() > 0:
+                                    overlay = self.display_image.copy()
+                                    # Create green overlay for human segmentation
+                                    human_colored = np.zeros_like(overlay)
+                                    human_colored[:, :, 1] = 255  # Green channel
+                                    human_colored = cv2.bitwise_and(human_colored, human_colored, mask=seg_mask)
+                                    cv2.addWeighted(overlay, 0.7, human_colored, 0.3, 0, self.display_image)
+                            except Exception as e:
+                                # Silently fail if segmentation fails
+                                pass
         
         # Draw grid if enabled
         if self.show_grid:
@@ -554,6 +899,12 @@ class GridCalibrator:
         if self.show_pose:
             cv2.putText(self.display_image, f"POSES: {len(self.detected_poses)}", 
                        (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        if self.yolo_detections:
+            cv2.putText(self.display_image, f"YOLO DETECTIONS: {len(self.yolo_detections)}", 
+                       (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        if self.yolo_detections:
+            cv2.putText(self.display_image, f"YOLO DETECTIONS: {len(self.yolo_detections)}", 
+                       (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         
         # Show image info
         image_name = self.image_path.name
@@ -636,10 +987,10 @@ class GridCalibrator:
                     start = landmarks[start_landmark]
                     end = landmarks[end_landmark]
                     if start['visibility'] > 0.3 and end['visibility'] > 0.3:
-                        cv2.line(self.display_image,
-                               (start['x'], start['y']),
-                               (end['x'], end['y']),
-                               (0, 255, 0), 2, cv2.LINE_AA)
+                        # Convert to integers for OpenCV
+                        pt1 = (int(start['x']), int(start['y']))
+                        pt2 = (int(end['x']), int(end['y']))
+                        cv2.line(self.display_image, pt1, pt2, (0, 255, 0), 2, cv2.LINE_AA)
             
             # Draw key landmarks (important points)
             key_landmarks = [
@@ -656,9 +1007,11 @@ class GridCalibrator:
                 if landmark in landmarks:
                     lm = landmarks[landmark]
                     if lm['visibility'] > 0.3:
+                        # Convert to integers for OpenCV
+                        center = (int(lm['x']), int(lm['y']))
                         # Draw circle for key point
-                        cv2.circle(self.display_image, (lm['x'], lm['y']), 5, (0, 255, 0), -1)
-                        cv2.circle(self.display_image, (lm['x'], lm['y']), 5, (0, 0, 0), 1)
+                        cv2.circle(self.display_image, center, 5, (0, 255, 0), -1)
+                        cv2.circle(self.display_image, center, 5, (0, 0, 0), 1)
             
             # Draw body orientation vector (shoulder to hip)
             if (mp_pose.PoseLandmark.LEFT_SHOULDER in landmarks and
@@ -671,11 +1024,11 @@ class GridCalibrator:
                 left_hip = landmarks[mp_pose.PoseLandmark.LEFT_HIP]
                 right_hip = landmarks[mp_pose.PoseLandmark.RIGHT_HIP]
                 
-                # Compute midpoints
-                shoulder_mid = ((left_shoulder['x'] + right_shoulder['x']) // 2,
-                               (left_shoulder['y'] + right_shoulder['y']) // 2)
-                hip_mid = ((left_hip['x'] + right_hip['x']) // 2,
-                          (left_hip['y'] + right_hip['y']) // 2)
+                # Compute midpoints (convert to integers)
+                shoulder_mid = (int((left_shoulder['x'] + right_shoulder['x']) / 2),
+                               int((left_shoulder['y'] + right_shoulder['y']) / 2))
+                hip_mid = (int((left_hip['x'] + right_hip['x']) / 2),
+                          int((left_hip['y'] + right_hip['y']) / 2))
                 
                 # Draw orientation arrow
                 cv2.arrowedLine(self.display_image, hip_mid, shoulder_mid,
@@ -730,29 +1083,61 @@ class GridCalibrator:
         self.update_display()
     
     def save_calibration(self):
-        """Save calibration parameters to JSON file"""
+        """Save calibration parameters to JSON file including manual trapezoid"""
+        if not self.trapezoid_points:
+            print("⚠ No trapezoid points to save")
+            return None
+        
         # Calculate trapezoid parameters
         top_left, top_right, bottom_right, bottom_left = self.trapezoid_points
         
         street_top_width = top_right[0] - top_left[0]
         street_bottom_width = bottom_right[0] - bottom_left[0]
+        street_top_y = top_left[1]
+        street_bottom_y = bottom_left[1]
+        street_height = street_bottom_y - street_top_y
         
+        # Build calibration dictionary with manual trapezoid parameters
         calibration = {
             'image_width': self.w,
             'image_height': self.h,
             'grid_rows': self.grid_rows,
             'grid_cols': self.grid_cols,
-            'street_trapezoid': {
-                'top_left': list(top_left),
-                'top_right': list(top_right),
-                'bottom_left': list(bottom_left),
-                'bottom_right': list(bottom_right),
-                'top_width': street_top_width,
-                'bottom_width': street_bottom_width
+            'manual_trapezoid': {
+                'top_left': [float(top_left[0]), float(top_left[1])],
+                'top_right': [float(top_right[0]), float(top_right[1])],
+                'bottom_left': [float(bottom_left[0]), float(bottom_left[1])],
+                'bottom_right': [float(bottom_right[0]), float(bottom_right[1])],
+                'top_width': float(street_top_width),
+                'bottom_width': float(street_bottom_width),
+                'top_y': float(street_top_y),
+                'bottom_y': float(street_bottom_y),
+                'height': float(street_height)
             },
-            # Note: pavement_width deprecated, using SegFormer-derived pavement_mask
-            'pavement_detection_method': 'segformer_derived'
+            # Keep old format for backward compatibility
+            'street_trapezoid': {
+                'top_left': [float(top_left[0]), float(top_left[1])],
+                'top_right': [float(top_right[0]), float(top_right[1])],
+                'bottom_left': [float(bottom_left[0]), float(bottom_left[1])],
+                'bottom_right': [float(bottom_right[0]), float(bottom_right[1])],
+                'top_width': float(street_top_width),
+                'bottom_width': float(street_bottom_width)
+            },
+            'pavement_detection_method': 'segformer_derived',
+            'note': 'Manual trapezoid and SegFormer detection are separate features'
         }
+        
+        # Add SegFormer parameters if available
+        if hasattr(self, 'road_polygon') and self.road_polygon:
+            calibration['segformer_road'] = {
+                'polygon_points': [[float(p[0]), float(p[1])] for p in self.road_polygon],
+                'num_points': len(self.road_polygon),
+                'detected': True
+            }
+        else:
+            calibration['segformer_road'] = {
+                'detected': False
+            }
         
         # Save to file in image directory
         output_path = self.image_dir / "grid_calibration.json"
@@ -760,10 +1145,20 @@ class GridCalibrator:
             json.dump(calibration, f, indent=2)
         
         print(f"\n✓ Calibration saved to: {output_path}")
+        print(f"  → This calibration will be automatically loaded for all images in: {self.image_dir}")
+        print(f"  → The trapezoid will be automatically scaled if images have different sizes")
         print("\nCalibration parameters:")
         print(f"  Grid: {self.grid_rows}x{self.grid_cols}")
-        print(f"  Street top width: {street_top_width:.1f}px")
-        print(f"  Street bottom width: {street_bottom_width:.1f}px")
+        print(f"  Manual Trapezoid:")
+        print(f"    - Top width: {street_top_width:.1f}px")
+        print(f"    - Bottom width: {street_bottom_width:.1f}px")
+        print(f"    - Height: {street_height:.1f}px")
+        print(f"    - Top-left: ({top_left[0]:.1f}, {top_left[1]:.1f})")
+        print(f"    - Top-right: ({top_right[0]:.1f}, {top_right[1]:.1f})")
+        print(f"    - Bottom-left: ({bottom_left[0]:.1f}, {bottom_left[1]:.1f})")
+        print(f"    - Bottom-right: ({bottom_right[0]:.1f}, {bottom_right[1]:.1f})")
+        if hasattr(self, 'road_polygon') and self.road_polygon:
+            print(f"  SegFormer Road: {len(self.road_polygon)} polygon points")
         if self.pavement_mask is not None:
             pavement_pixels = (self.pavement_mask > 0).sum()
             print(f"  Pavement: {pavement_pixels} pixels (SegFormer-derived)")
@@ -794,8 +1189,12 @@ class GridCalibrator:
         print("  - Press 'R' to reset to default")
         print("\nDisplay:")
         print("  - Press 'G' to toggle grid overlay")
-        print("  - Press 'S' to save calibration")
+        print("  - Press 'S' to save calibration to grid_calibration.json")
+        print("     → Saved calibration will be auto-loaded for all images")
+        print("     → Trapezoid scales automatically for different image sizes")
         print("  - Press 'Q' or ESC to quit")
+        print("\n💡 TIP: Adjust trapezoid on one image, press 'S' to save,")
+        print("   then navigate to other images - the grid will be automatically applied!")
         print("="*60 + "\n")
     
     def run(self):
@@ -891,8 +1290,11 @@ class GridCalibrator:
 
 # Example usage
 if __name__ == "__main__":
-    # Set image directory
-    image_dir = Path("rsud20k_person2000_resized/images/train")
+    # Set image directory to rsud20k train images
+    image_dir = Path("rsud20k/images/train")
+    
+    # Optional: Use custom YOLO model (set to None to use default YOLO12n)
+    yolo_model_path = None  # Set to Path("best_500 image.pt") if you want to use custom model
     
     # Optional: Load existing calibration
     calibration_file = None  # Set to path if you have existing calibration
@@ -903,8 +1305,9 @@ if __name__ == "__main__":
     else:
         calibrator = GridCalibrator(
             image_dir, 
-            grid_rows=8, 
-            grid_cols=6,
-            calibration_file=calibration_file
+            grid_rows=12, 
+            grid_cols=12,
+            calibration_file=calibration_file,
+            yolo_model_path=yolo_model_path
         )
         calibrator.run()
