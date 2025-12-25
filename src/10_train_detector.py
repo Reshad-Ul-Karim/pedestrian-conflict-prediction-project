@@ -120,8 +120,8 @@ def train_detector(config_path: str, data_yaml: str, resume: bool = False):
         'patience': config.validation.patience,
         
         # Logging
-        'verbose': True,
-        'plots': True,
+        'verbose': config.logging.get('verbose', True),
+        'plots': config.logging.get('plots', True),
     }
     
     logger.info("\nTraining Configuration:")

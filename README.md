@@ -1,12 +1,15 @@
-# Pedestrian Conflict Prediction: Advanced Trajectory-Based Framework
+# Pedestrian Conflict Prediction: Real-Time Grid-Based Framework
 
 ## Overview
 
-This research project implements a novel framework for predicting pedestrian-vehicle conflicts using advanced trajectory prediction and weak-supervised learning. The system combines:
-- **Multi-object detection and tracking** on dashcam videos
-- **Sophisticated trajectory prediction** using attention mechanisms and social interaction modeling
-- **Physics-aware conflict detection** with time-to-conflict (TTC) and post-encroachment time (PET) metrics
-- **Weakly-supervised fusion model** that learns from trajectory-based auto-labels
+This research project implements a real-time framework for predicting pedestrian-vehicle conflicts using grid-based detection and pose analysis. The system combines:
+- **YOLO12 multi-object detection** for reliable object detection
+- **Multi-object tracking** for persistent object tracking across frames
+- **MediaPipe pose estimation** for pedestrian pose analysis
+- **Grid-based conflict detection** with two key rules:
+  - **Rule 1:** Person pose inclination detection (leaning forward, crossing motion) → conflict probability
+  - **Rule 2:** Vehicle proximity + grid coverage (too close to camera, covering conflict zone) → conflict probability
+- **Real-time processing** optimized for live video streams
 
 ---
 
@@ -36,23 +39,19 @@ project/
     reports/              # Metrics, visualizations, analysis
   src/
     00_env_setup.md       # Environment configuration
-    10_train_detector.py  # YOLO detector training
+    10_train_detector.py  # YOLO12 detector training (optional)
     20_run_tracker.py     # Multi-object tracking pipeline
-    30_extract_trajectories.py  # Trajectory extraction with pose estimation
+    30_extract_trajectories.py  # Trajectory extraction with MediaPipe pose
     35_compute_kinematics.py    # Velocity, acceleration, heading estimation
-    40_predict_trajectories.py  # Multi-horizon trajectory prediction
-    45_compute_conflict_metrics.py  # TTC, PET, conflict zone detection
-    50_build_training_clips.py  # Clip generation for model training
-    60_train_trajectory_predictor.py  # Trajectory prediction model
-    65_train_conflict_predictor.py    # Conflict prediction fusion model
+    realtime_grid_conflict_detector.py  # Grid-based conflict detection
+    realtime_conflict_pipeline.py       # Complete real-time pipeline
+    45_compute_conflict_metrics.py  # Conflict metrics (legacy/optional)
     70_evaluate_system.py  # Comprehensive evaluation
-    80_distill_and_export.py  # Model distillation and deployment
   configs/
-    detector.yaml         # Detection model configs
+    detector.yaml         # YOLO12 detection configs
     tracker.yaml          # Tracking parameters
-    trajectory.yaml       # Trajectory prediction configs
-    conflict.yaml         # Conflict detection parameters
-    model.yaml            # Fusion model architecture
+    trajectory.yaml       # Trajectory extraction configs
+    realtime_conflict.yaml  # Real-time conflict detection parameters
 ```
 
 ### Step 0.2 – Environment Setup
@@ -60,12 +59,11 @@ project/
 **Core Dependencies:**
 - Python 3.9+ (3.9 recommended for compatibility)
 - PyTorch 2.0+ (with MPS support for Apple Silicon / CUDA for NVIDIA)
-- Ultralytics YOLOv8
+- **Ultralytics YOLO12** (latest YOLO version)
 - OpenCV 4.8+
-- MediaPipe (for pose estimation)
-- ByteTrack (tracking implementation)
-- PyTorch Geometric (for graph-based trajectory models)
-- Transformers (HuggingFace, for temporal encoding)
+- **MediaPipe** (for pose estimation - required for pedestrian conflict detection)
+- Tracking algorithm (ByteTrack or custom implementation)
+- NumPy, SciPy (for signal processing)
 - CoreMLTools (for model conversion and deployment on macOS/iOS)
 
 **Setup Instructions:**
@@ -136,38 +134,46 @@ project/
    - RSUD20K: Train (70%) / Val (15%) / Test (15%)
    - Dashcam videos: Split by video/scenario (no temporal leakage)
 
-### Step 1.2 – Detector Training
+### Step 1.2 – Detector Setup
 
-**Model: YOLOv8m (or YOLOv8l for better accuracy)**
+**Model: YOLO12 (YOLOv12)**
 
-  ```bash
-  yolo detect train \
-    data=configs/rsud20k.yaml \
-      model=yolov8m.pt \
-    epochs=150 \
-      imgsz=640 \
-    batch=16 \
-    name=detector_rsud20k \
-    project=outputs/models
-```
+YOLO12 is the latest version with improved accuracy and speed. You can either:
+1. **Use pre-trained YOLO12** (recommended for quick start):
+   ```python
+   from ultralytics import YOLO
+   model = YOLO('yolo12n.pt')  # nano - fastest
+   # or
+   model = YOLO('yolo12s.pt')  # small - balanced
+   # or
+   model = YOLO('yolo12m.pt')  # medium - better accuracy
+   ```
+
+2. **Fine-tune on RSUD20K** (optional, for domain-specific improvement):
+   ```bash
+   yolo detect train \
+     data=configs/rsud20k.yaml \
+     model=yolo12m.pt \
+     epochs=100 \
+     imgsz=640 \
+     batch=16 \
+     name=detector_rsud20k \
+     project=outputs/models
+   ```
 
 **Key configurations:**
-- Augmentations: Mosaic, mixup, random affine, color jitter, motion blur
-- Loss weights: Balance pedestrian class (increase weight if imbalanced)
-- Validation: Monitor per-class mAP, especially `person` class
+- Use YOLO12 for best performance
+- Monitor pedestrian class mAP during training
+- Recommended: Start with pre-trained model, fine-tune if needed
 
-**Optional: Domain adaptation**
-- Fine-tune on combined RSUD20K + BadODD
-- Use test-time augmentation for robustness
-
-**Deliverable:** `outputs/models/detector_rsud20k.pt`
+**Deliverable:** `yolo12n.pt` (pre-trained) or `outputs/models/detector_rsud20k/weights/best.pt` (fine-tuned)
 
 ### Step 1.3 – Multi-Object Tracking
 
 **Pipeline: `20_run_tracker.py`**
 
 1. **Detection:**
-   - Run YOLOv8 on each frame (GPU acceleration)
+   - Run YOLO12 on each frame (GPU acceleration)
    - Filter low-confidence detections (threshold: 0.5)
    - Apply NMS (IoU threshold: 0.45)
 
@@ -394,542 +400,422 @@ For each track at time `t0`:
 
 ---
 
-## Phase 4 — Conflict Detection and Weak Label Generation
+## Phase 4 — Real-Time Grid-Based Conflict Detection
 
-### Step 4.1 – Dynamic Conflict Zone Definition
+### Step 4.1 – Grid-Based Conflict Zone Definition
 
-**Pipeline: `45_compute_conflict_metrics.py`**
+**Pipeline: `realtime_grid_conflict_detector.py`**
 
-Instead of a static grid, define a **dynamic ego-vehicle conflict zone** based on:
+The system uses a **grid-based approach** to define conflict zones in the camera feed:
 
-1. **Ego corridor (image-space approximation):**
-   - Bottom-middle region of image (e.g., rows 6-7 out of 8, cols 2-3 out of 6)
-   - Can be adaptive based on ego speed (if available)
+1. **Grid Structure:**
+   - Divide camera frame into grid (default: 8 rows × 6 columns)
+   - Each cell represents a spatial region in the image
+   - Configurable grid size based on camera resolution
 
-2. **Expanded conflict zone:**
-   - Include nearby cells that could lead to conflict
-   - Buffer: 1-2 grid cells around ego corridor
+2. **Conflict Zone (Ego Corridor):**
+   - **Default:** Bottom-middle region (rows 6-7, columns 2-3)
+   - Represents the area where the ego vehicle would be
+   - Can be adjusted based on camera mounting position
+   - Example: For 8×6 grid, conflict zone = bottom 2 rows, middle 2 columns
 
-3. **Time-to-Conflict (TTC) approximation:**
-   - For predicted trajectory point at horizon Δt:
-     - Check if point is in conflict zone
-     - TTC ≈ Δt (if predicted to be in zone at Δt)
-   - More sophisticated: Linear interpolation to find exact TTC
-
-### Step 4.2 – Conflict Metrics Computation
-
-#### Primary Metrics:
-
-1. **Time-to-Conflict (TTC):**
+3. **Grid Cell Mapping:**
    ```python
-   # For each predicted horizon, check if point enters conflict zone
-   for Δt in [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]:
-       pred_point = trajectory_predictor.predict(t0, Δt)
-       if pred_point in conflict_zone:
-           TTC = Δt  # Approximate
-           break
+   # Convert pixel coordinates to grid cell
+   cell_width = frame_width / grid_cols
+   cell_height = frame_height / grid_rows
+   grid_row = int(center_y / cell_height)
+   grid_col = int(center_x / cell_width)
    ```
 
-2. **Post-Encroachment Time (PET):**
-   - Time difference between when object leaves conflict zone and when ego would have passed
-   - Requires ego speed estimation (can be approximated from video)
+### Step 4.2 – Conflict Detection Rules
 
-3. **Minimum Distance (MinD):**
-   - Closest predicted distance between object and ego corridor center
-   - Lower MinD → higher conflict risk
+The system implements **two primary conflict detection rules**:
 
-4. **Collision Probability:**
-     ```python
-   # Use predicted uncertainty (if available)
-   if has_uncertainty:
-       # Integrate over uncertainty distribution within conflict zone
-       collision_prob = integrate_gaussian_over_zone(pred_mean, pred_cov, conflict_zone)
-   else:
-       collision_prob = 1.0 if pred_point in zone else 0.0
-   ```
+#### Rule 1: Person Pose Inclination Detection
 
-#### Conflict Label Generation:
+**For pedestrians (person class):**
 
-For each `(video, track_id, t0)`:
+Uses **MediaPipe pose estimation** to detect conflict-indicating poses:
 
+1. **Torso Angle Analysis:**
+   - Extract key landmarks: shoulders, hips, ankles
+   - Compute torso vector (hip to shoulder)
+   - Calculate angle from vertical
+   - **Conflict indicator:** Forward lean > 15° (crossing motion)
+
+2. **Leg Position Analysis:**
+   - Check leg separation and height difference
+   - **Conflict indicators:**
+     - Legs apart (walking motion)
+     - One leg raised (running motion)
+     - Leg separation > 20 pixels or height diff > 15 pixels
+
+3. **Position in Conflict Zone:**
+   - Check if person is in conflict zone grid cells
+   - Higher conflict probability if in ego corridor
+
+4. **Temporal Consistency:**
+   - Track pose angle over time
+   - Increasing forward lean → higher conflict probability
+   - Maintains history of last 30 frames for smoothing
+
+**Conflict Score Calculation:**
 ```python
-conflict_labels = {}
-for Δt in [1.0, 2.0, 3.0]:  # Primary horizons
-    pred_point = predictions[Δt]
-    in_zone = check_conflict_zone(pred_point)
-    
-    # Binary label
-    y_Δt = 1 if in_zone else 0
-    
-    # Confidence score (0-1)
-    w_Δt = compute_confidence(
-        current_distance=current_pos_to_zone,
-        velocity_towards_zone=velocity_component,
-        trajectory_stability=trajectory_smoothness,
-        prediction_confidence=model_confidence,
-        time_to_conflict=TTC
-    )
-    
-    conflict_labels[f"y_{Δt}s"] = y_Δt
-    conflict_labels[f"w_{Δt}s"] = w_Δt
-    conflict_labels[f"ttc_{Δt}s"] = TTC if in_zone else None
+conflict_score = 0.0
+
+# Torso inclination (0.3 weight)
+if abs(torso_angle) > 15:
+    conflict_score += 0.3
+
+# Leg position (0.2 weight)
+if leg_separation > 20 or leg_height_diff > 15:
+    conflict_score += 0.2
+
+# Position in conflict zone (0.3 weight)
+if grid_cell in conflict_zone:
+    conflict_score += 0.3
+
+# Temporal trend (0.2 weight)
+if angle_trend > 2:  # Increasing forward lean
+    conflict_score += 0.2
+
+# Threshold: conflict_prob > 0.5 → conflict detected
 ```
 
-**Confidence computation factors:**
-- **High confidence (w > 0.8):**
-  - Object is close to conflict zone (NEAR_ROWS)
-  - Velocity directly towards zone
-  - Stable trajectory (low variance in velocity direction)
-  - High prediction model confidence
-  - For pedestrians: motion perpendicular to lane (crossing behavior)
-  
-- **Low confidence (w < 0.5):**
-  - Object far from zone
-  - Velocity parallel or away from zone
-  - Unstable trajectory (frequent direction changes)
-  - Short track history
-  - Occluded or partially detected
+#### Rule 2: Vehicle Proximity + Grid Coverage
 
-**Output format:**
-```json
-{
-  "video_id": "kitti_001",
-  "track_id": 5,
-  "t0": 4.0,
-  "current_state": {
-    "u": 450.2, "v": 610.5,
-  "grid_cell": [6, 3],
-    "velocity": {"v_u": 2.1, "v_v": -5.3},
-    "distance_to_zone": 15.2
-  },
-  "conflict_labels": {
-    "y_1s": 1, "w_1s": 0.92, "ttc_1s": 0.85,
-    "y_2s": 1, "w_2s": 0.88, "ttc_2s": 1.8,
-    "y_3s": 0, "w_3s": 0.35, "ttc_3s": null
-  },
-  "metrics": {
-    "min_distance": 12.5,
-    "pet": null,
-    "collision_prob_1s": 0.89,
-    "collision_prob_2s": 0.76
-  }
-}
-```
+**For non-human objects (vehicles, bicycles, etc.):**
 
-**Output:** `outputs/autolabels/{video_id}.jsonl`
+1. **Proximity Detection:**
+   - Measure bbox height relative to frame height
+   - **Conflict indicator:** bbox_height / frame_height > 0.4 (40% threshold)
+   - Large bbox = object too close to camera
 
----
+2. **Grid Coverage Analysis:**
+   - Calculate which grid cells are covered by object bbox
+   - Count conflict zone cells covered
+   - **Conflict indicator:** coverage_ratio > 0.3 (30% of conflict zone)
 
-## Phase 5 — Training Clip Generation
+3. **Position Check:**
+   - Verify object center is in conflict zone
+   - Additional weight if in ego corridor
 
-### Step 5.1 – Temporal Clip Extraction
+4. **Temporal Consistency:**
+   - Track conflict scores over time
+   - Consistent high scores → confirmed conflict
 
-**Pipeline: `50_build_training_clips.py`**
-
-For each labeled timepoint `(video_id, track_id, t0)`:
-
-1. **Time window:**
-   - Extract `[t0 - 1.5s, t0 + 0.5s]` (2-second window, future-leaning)
-   - Sample frames at fixed FPS (e.g., 10 fps → 20 frames)
-
-2. **Visual clip:**
-   - Crop around track bbox (with padding: 1.5× bbox size)
-   - Resize to fixed size: 128×128 or 112×112
-   - Apply normalization (ImageNet stats)
-
-3. **Kinematic sequence:**
-   - For each frame in window:
-     ```python
-     features = [
-         u_normalized, v_normalized,  # Position (0-1)
-         v_u_normalized, v_v_normalized,  # Velocity (normalized)
-         a_u_normalized, a_v_normalized,  # Acceleration
-         heading_sin, heading_cos,  # Heading (sine/cosine encoding)
-         class_embedding,  # One-hot or learned embedding
-         grid_row_normalized, grid_col_normalized,
-         distance_to_zone_normalized,
-         speed_normalized
-     ]
-     ```
-
-4. **Context features:**
-   - Number of nearby objects (within 100 pixels)
-   - Average speed of nearby objects
-   - Ego speed (if available, else approximate from video motion)
-
-5. **Labels:**
-   - Multi-horizon conflict labels: `y_1s, y_2s, y_3s`
-   - Confidence weights: `w_1s, w_2s, w_3s`
-   - TTC values (if conflict predicted)
-
-**Output structure:**
+**Conflict Score Calculation:**
 ```python
-{
-    "clip_id": "kitti_001_track5_t4.0",
-    "video_id": "kitti_001",
-    "track_id": 5,
-    "t0": 4.0,
-    "visual_clip": "clips/kitti_001_track5_t4.0_visual.npy",  # Shape: [T, C, H, W]
-    "kinematic_seq": "clips/kitti_001_track5_t4.0_kin.npy",   # Shape: [T, F]
-    "labels": {
-        "y_1s": 1, "w_1s": 0.92,
-        "y_2s": 1, "w_2s": 0.88,
-        "y_3s": 0, "w_3s": 0.35
-    },
-    "metadata": {
-        "class": "person",
-        "num_frames": 20,
-        "fps": 10
-    }
-}
+conflict_score = 0.0
+
+# Proximity check (0.4 weight)
+if bbox_height_ratio > 0.4:
+    conflict_score += 0.4
+
+# Grid coverage (0.4 weight)
+if coverage_ratio > 0.3:
+    conflict_score += 0.4
+
+# Position in conflict zone (0.2 weight)
+if grid_cell in conflict_zone:
+    conflict_score += 0.2
+
+# Temporal consistency (0.1 weight)
+if mean(prev_conflicts) > 0.5:
+    conflict_score += 0.1
+
+# Threshold: conflict_prob > 0.5 → conflict detected
 ```
 
-**Metadata index:** `outputs/clips/metadata.csv` with all clip references
+### Step 4.3 – Real-Time Processing Pipeline
 
----
+**Pipeline: `realtime_conflict_pipeline.py`**
 
-## Phase 6 — Conflict Prediction Model Training
+Complete end-to-end pipeline:
 
-### Step 6.1 – Model Architecture
+1. **Frame Input:**
+   - Video stream (webcam, video file, or RTSP)
+   - Process frame-by-frame in real-time
 
-**Pipeline: `65_train_conflict_predictor.py`**
-
-**Two-stage approach:**
-
-#### Stage 1: Trajectory Prediction Model (if not pre-trained)
-
-Train the trajectory predictor from Phase 3 on all trajectory data (self-supervised).
-
-#### Stage 2: Conflict Prediction Fusion Model
-
-**Architecture:**
-
-1. **Vision Encoder (Spatio-Temporal):**
-   - Input: Video clip `[T, C, H, W]` (e.g., 20 frames × 3 channels × 128×128)
-   - Backbone options:
-     - **3D ResNet-18** or **R(2+1)D-18** (recommended for efficiency)
-     - **TimeSformer-tiny** (transformer-based, more compute)
-     - **I3D** (Inflated 3D ConvNet)
-   - Output: Temporal feature sequence `[T, D_v]` or pooled `[D_v]`
-
-2. **Kinematics Encoder (Temporal):**
-   - Input: Kinematic sequence `[T, F]` (F = feature dimension)
-   - Architecture:
-     - **Option A:** 1-2 layer BiLSTM/GRU (hidden: 64-128)
-     - **Option B:** Transformer encoder (small, 2-4 layers)
-     - **Option C:** Temporal Convolutional Network (TCN)
-   - Output: Encoded kinematics `[D_k]`
-
-3. **Fusion Module:**
+2. **Detection → Tracking → Conflict Detection:**
    ```python
-   # Option A: Simple concatenation
-   z = concat(f_vision, f_kinematics)  # [D_v + D_k]
+   # Step 1: YOLO12 Detection
+   detections = yolo12_model(frame)
    
-   # Option B: Cross-attention (more expressive)
-   f_fused = CrossAttention(f_vision, f_kinematics)
-   z = concat(f_vision, f_fused, f_kinematics)
+   # Step 2: Tracking
+   tracks = tracker.update(detections)
    
-   # Option C: Late fusion with learned weights
-   alpha = sigmoid(MLP([f_vision, f_kinematics]))
-   z = alpha * f_vision + (1 - alpha) * f_kinematics
+   # Step 3: Grid-based Conflict Detection
+   conflicts = conflict_detector.detect_conflicts(frame, tracks)
    ```
 
-4. **Conflict Prediction Heads:**
+3. **Output Format:**
+   ```json
+   {
+     "frame_id": 120,
+     "pedestrian_conflicts": [
+       {
+         "track_id": 5,
+         "conflict_probability": 0.85,
+         "grid_cell": [6, 3],
+         "reason": "pose_inclination",
+         "bbox": [x1, y1, x2, y2]
+       }
+     ],
+     "vehicle_conflicts": [
+       {
+         "track_id": 12,
+         "conflict_probability": 0.72,
+         "grid_cells_covered": [[6,2], [6,3], [7,2], [7,3]],
+         "reason": "proximity_and_coverage",
+         "bbox": [x1, y1, x2, y2]
+       }
+     ],
+     "grid_occupancy": [[...], [...]]  # 8x6 grid
+   }
+   ```
+
+4. **Visualization:**
+   - Draw grid overlay on frame
+   - Highlight conflict zone in red
+   - Draw bounding boxes with conflict alerts
+   - Display conflict probability scores
+
+**Output:** Real-time conflict alerts + visualization
+
+---
+
+## Phase 5 — Real-Time Usage and Integration
+
+### Step 5.1 – Running Real-Time Conflict Detection
+
+**Pipeline: `realtime_conflict_pipeline.py`**
+
+1. **Initialize Pipeline:**
    ```python
-   # Shared backbone
-   h = MLP(z, hidden=[256, 128], activation='ReLU', dropout=0.3)
+   from src.realtime_conflict_pipeline import RealtimeConflictPipeline
    
-   # Multi-horizon heads
-   logits_1s = Linear(h, 1)
-   logits_2s = Linear(h, 1)
-   logits_3s = Linear(h, 1)
-   
-   # Optional: TTC regression head
-   ttc_logits = Linear(h, 1)  # Predict TTC (sigmoid * max_ttc)
-   ```
-
-5. **Output:**
-   - Probabilities: `p_1s = sigmoid(logits_1s)`, etc.
-   - TTC: `ttc_pred = sigmoid(ttc_logits) * 3.0` (if using TTC head)
-
-### Step 6.2 – Training Objective
-
-**Loss function:**
-
-```python
-# Weighted Binary Cross-Entropy for each horizon
-loss_conflict = 0
-for Δt in [1.0, 2.0, 3.0]:
-    w = labels[f'w_{Δt}s']  # Confidence weight
-    y = labels[f'y_{Δt}s']   # Binary label
-    p = predictions[f'p_{Δt}s']
-    
-    # Focal loss variant for hard examples
-    bce = -[y * log(p) + (1-y) * log(1-p)]
-    focal = alpha * (1 - p)^gamma * bce  # gamma=2, alpha=0.25
-    
-    loss_conflict += w * focal
-
-# Optional: TTC regression loss
-if predict_ttc:
-    ttc_true = labels['ttc'] if labels['y_1s'] == 1 else 0.0
-    loss_ttc = L1(ttc_pred, ttc_true) * mask  # Only on positive samples
-    loss_total = loss_conflict + lambda_ttc * loss_ttc
-else:
-    loss_total = loss_conflict
-```
-
-**Training strategy:**
-
-1. **Curriculum learning:**
-   - Phase 1: Train only high-confidence samples (w ≥ 0.8)
-   - Phase 2: Gradually include medium-confidence (w ≥ 0.6)
-   - Phase 3: Full dataset
-
-2. **Data augmentation:**
-   - Temporal: Random frame dropping, temporal jittering
-   - Spatial: Random crop, horizontal flip (adjust kinematics accordingly)
-   - Kinematic noise: Add small Gaussian noise to velocity/acceleration
-
-3. **Optimization:**
-   - Optimizer: AdamW (lr=1e-4, weight_decay=1e-4)
-   - Learning rate schedule: Cosine annealing with warmup
-   - Batch size: 16-32 (depending on GPU memory)
-   - Epochs: 30-50 (with early stopping)
-
-4. **Validation:**
-   - Monitor: Val loss, Precision@Recall, Lead-time metrics
-   - Early stopping: Patience=10 epochs on val loss
-
-**Deliverable:** `outputs/models/conflict_predictor_fusion.pt`
-
----
-
-## Phase 7 — Evaluation Framework
-
-### Step 7.1 – Comprehensive Metrics
-
-**Pipeline: `70_evaluate_system.py`**
-
-#### Trajectory Prediction Metrics:
-
-1. **Average Displacement Error (ADE):**
-   - Mean L2 distance between predicted and true positions
-
-2. **Final Displacement Error (FDE):**
-   - L2 distance at final horizon (e.g., 3s)
-
-3. **Per-horizon ADE:**
-   - ADE at each prediction horizon
-
-#### Conflict Prediction Metrics:
-
-1. **Classification Metrics:**
-   - Precision, Recall, F1-score (per horizon)
-   - Precision-Recall curves
-   - ROC-AUC
-
-2. **Lead-time Metrics:**
-   - **Lead-time@Precision:**
-     - For each true conflict event, find earliest prediction ≥ threshold that occurred before event
-     - Compute median/mean lead time
-   - **Lead-time@Recall:**
-     - Similar, but focus on recall of events
-
-3. **Calibration:**
-   - Expected Calibration Error (ECE)
-   - Brier Score
-   - Reliability diagrams
-
-4. **TTC Estimation:**
-   - Mean Absolute Error (MAE) of predicted vs. true TTC
-   - Only on samples where conflict occurs
-
-5. **Scenario Breakdown:**
-   - Day vs. night
-   - Dense vs. sparse traffic
-   - Pedestrians vs. vehicles vs. two-wheelers
-   - Urban vs. highway (if available)
-   - Weather conditions (if available)
-
-#### Ablation Studies:
-
-1. **Component ablation:**
-   - Vision only vs. Kinematics only vs. Fusion
-   - Different fusion methods
-   - With/without trajectory prediction module
-
-2. **Architecture ablation:**
-   - Different backbone choices (3D CNN vs. Transformer)
-   - Different horizon combinations
-   - Impact of confidence weighting
-
-3. **Data ablation:**
-   - Impact of trajectory prediction quality
-   - Effect of confidence thresholds
-   - Curriculum learning impact
-
-### Step 7.2 – Qualitative Analysis
-
-1. **Visualization tools:**
-   - Overlay predicted trajectories on video frames
-   - Show conflict zone and predicted conflict probabilities over time
-   - Highlight true vs. predicted conflicts
-
-2. **Failure case analysis:**
-   - False positives: High prediction but no conflict
-   - False negatives: Missed conflicts
-   - Analyze patterns in failures
-
-**Output:** `outputs/reports/evaluation_report.pdf` with metrics, plots, and analysis
-
----
-
-## Phase 8 — Model Distillation and Deployment
-
-### Step 8.1 – Knowledge Distillation
-
-**Pipeline: `80_distill_and_export.py`**
-
-**Student model architecture:**
-- **Vision:** MobileNetV3-Small 2D CNN with temporal average pooling (or tiny 3D CNN)
-- **Kinematics:** 1D CNN (3-5 layers) or small GRU (hidden: 32)
-- **Fusion:** Simple concatenation + 2-layer MLP
-- **Target:** < 10M parameters, < 50ms inference on edge device
-
-**Distillation loss:**
-```python
-# Hard labels (from autolabels)
-loss_hard = weighted_BCE(y_true, p_student)
-
-# Soft labels (from teacher)
-loss_soft = KL_divergence(p_teacher, p_student)
-
-# Combined
-loss = alpha * loss_hard + (1 - alpha) * T^2 * loss_soft
-# T = temperature (typically 3-5)
-```
-
-**Training:**
-- Lower resolution: 96×96 frames
-- Fewer frames: 12-16 frames per clip
-- Batch size: 32-64
-- Learning rate: 1e-3 (higher for student)
-
-**Deliverable:** `outputs/models/conflict_predictor_mobile.pt`
-
-### Step 8.2 – Model Export
-
-1. **ONNX export:**
-  ```python
-   torch.onnx.export(
-       model, example_input,
-       "conflict_predictor.onnx",
-       opset_version=17,
-       input_names=['visual', 'kinematics'],
-       output_names=['p_1s', 'p_2s', 'p_3s', 'ttc']
+   pipeline = RealtimeConflictPipeline(
+       yolo_model_path="yolo12n.pt",  # or path to fine-tuned model
+       grid_rows=8,
+       grid_cols=6
    )
    ```
 
-2. **TensorRT optimization (optional):**
-   - For NVIDIA GPUs/Jetson devices
-   - FP16 or INT8 quantization
-
-3. **TensorFlow Lite (optional):**
-   - For mobile/embedded devices
-   - Quantization: INT8
-
-### Step 8.3 – Real-time Inference Pipeline
-
-**Inference workflow:**
-
-1. **Frame processing:**
-   - Run detector → tracker → trajectory extraction
-   - Maintain trajectory buffers (sliding window)
-
-2. **Prediction:**
-   - For each active track:
-     - Extract visual clip and kinematic sequence
-     - Run conflict predictor
-     - Get probabilities `p_1s, p_2s, p_3s`
-
-3. **Alert logic:**
+2. **Process Video Stream:**
    ```python
-   p_max = max(p_1s, p_2s, p_3s)
-   most_dangerous_track = argmax(p_max over tracks)
+   # From webcam
+   cap = cv2.VideoCapture(0)
    
-   if p_max[most_dangerous_track] >= 0.8:
-       # High alert
-       trigger_alert(level='high', track_id=most_dangerous_track)
-   elif p_max[most_dangerous_track] >= 0.6:
-       # Warning
-       trigger_alert(level='warning', track_id=most_dangerous_track)
+   # Or from video file
+   cap = cv2.VideoCapture("path/to/video.mp4")
    
-   # Cooldown: 2 seconds between alerts
-   # Suppress if trajectory unstable (low confidence)
+   while True:
+       ret, frame = cap.read()
+       if not ret:
+           break
+       
+       # Process frame
+       result = pipeline.process_frame(frame)
+       
+       # Visualize
+       vis_frame = pipeline.visualize(frame, result)
+       cv2.imshow('Conflict Detection', vis_frame)
+       
+       if cv2.waitKey(1) & 0xFF == ord('q'):
+           break
    ```
 
-**Target performance:**
-- End-to-end latency: < 100ms per frame (10+ FPS)
-- On edge device (Jetson Nano/Orin): Optimize for real-time
+3. **Access Conflict Results:**
+   ```python
+   # Check for conflicts
+   if result['conflicts']['pedestrian_conflicts']:
+       for conflict in result['conflicts']['pedestrian_conflicts']:
+           print(f"Pedestrian conflict detected! Track ID: {conflict['track_id']}, "
+                 f"Probability: {conflict['conflict_probability']:.2f}")
+   
+   if result['conflicts']['vehicle_conflicts']:
+       for conflict in result['conflicts']['vehicle_conflicts']:
+           print(f"Vehicle conflict detected! Track ID: {conflict['track_id']}, "
+                 f"Probability: {conflict['conflict_probability']:.2f}")
+   ```
+
+### Step 5.2 – Configuration
+
+**Config file: `configs/realtime_conflict.yaml`**
+
+```yaml
+grid:
+  rows: 8
+  cols: 6
+  conflict_zone_rows: [6, 7]  # Bottom 2 rows
+  conflict_zone_cols: [2, 3]   # Middle 2 columns
+
+detection:
+  proximity_threshold: 0.4      # 40% of frame height = "too close"
+  coverage_threshold: 0.3        # 30% of conflict zone cells
+
+pose:
+  torso_angle_threshold: 15     # Degrees for forward lean
+  leg_separation_threshold: 20  # Pixels
+  leg_height_diff_threshold: 15 # Pixels
+
+yolo:
+  model_path: "yolo12n.pt"
+  conf_threshold: 0.5
+  iou_threshold: 0.45
+```
+
+### Step 5.3 – Performance Optimization
+
+**For Real-Time Processing:**
+
+1. **Model Selection:**
+   - Use `yolo12n.pt` (nano) for fastest inference
+   - Use `yolo12s.pt` (small) for balanced speed/accuracy
+   - Use `yolo12m.pt` (medium) for better accuracy (slower)
+
+2. **Frame Processing:**
+   - Process every Nth frame if needed (skip frames for speed)
+   - Use GPU acceleration (MPS/CUDA)
+   - Reduce input resolution if needed
+
+3. **Grid Optimization:**
+   - Smaller grid (6×4) = faster processing
+   - Larger grid (10×8) = more precise detection
+
+**Target Performance:**
+- **Desktop GPU:** 30+ FPS
+- **Edge Device:** 10-15 FPS (with optimizations)
 
 ---
 
-## Phase 9 — Research Outputs and Documentation
+## Phase 6 — Evaluation Framework
+
+### Step 6.1 – Conflict Detection Metrics
+
+**Pipeline: `70_evaluate_system.py`**
+
+#### Primary Metrics:
+
+1. **Conflict Detection Accuracy:**
+   - True Positives (TP): Correctly detected conflicts
+   - False Positives (FP): Incorrect conflict alerts
+   - False Negatives (FN): Missed conflicts
+   - Precision = TP / (TP + FP)
+   - Recall = TP / (TP + FN)
+   - F1-Score = 2 × (Precision × Recall) / (Precision + Recall)
+
+2. **Per-Class Performance:**
+   - Pedestrian conflict detection accuracy
+   - Vehicle conflict detection accuracy
+   - Separate metrics for each conflict rule
+
+3. **Temporal Analysis:**
+   - Average time before conflict (lead time)
+   - Conflict duration accuracy
+   - False alarm rate per minute
+
+4. **Grid-Based Metrics:**
+   - Conflict zone occupancy accuracy
+   - Grid cell prediction accuracy
+   - Spatial localization error
+
+#### Scenario Breakdown:
+
+1. **Lighting Conditions:**
+   - Day vs. night performance
+   - Low-light conflict detection
+
+2. **Traffic Density:**
+   - Sparse traffic (1-3 objects)
+   - Dense traffic (10+ objects)
+   - Crowded scenarios
+
+3. **Object Types:**
+   - Pedestrians (walking, running, standing)
+   - Vehicles (cars, trucks, buses, motorcycles)
+   - Two-wheelers (bicycles, motorcycles)
+
+4. **Pose Variations:**
+   - Different pedestrian poses
+   - Occlusion scenarios
+   - Partial visibility
+
+### Step 6.2 – Qualitative Analysis
+
+1. **Visualization:**
+   - Overlay grid and conflict zones on video
+   - Highlight detected conflicts with bounding boxes
+   - Show conflict probability scores
+   - Display pose landmarks for pedestrians
+
+2. **Failure Case Analysis:**
+   - False positives: Analyze why non-conflicts were flagged
+   - False negatives: Analyze why conflicts were missed
+   - Pose estimation failures
+   - Tracking failures
+
+**Output:** `outputs/reports/evaluation_report.pdf` with metrics, visualizations, and analysis
+
+---
+
+## Phase 7 — Research Outputs and Documentation
 
 ### Methodology Section:
 
 1. **Detection and Tracking:**
-   - YOLOv8 training on RSUD20K/BadODD
-   - ByteTrack multi-object tracking
+   - YOLO12 object detection (pre-trained or fine-tuned on RSUD20K/BadODD)
+   - Multi-object tracking algorithm (ByteTrack or custom)
    - Evaluation metrics (mAP, tracking accuracy)
 
-2. **Trajectory Extraction:**
+2. **Pose Estimation:**
    - MediaPipe pose estimation for pedestrians
-   - Kinematics computation (velocity, acceleration, heading)
-   - Trajectory smoothing and quality metrics
+   - Key landmark extraction (shoulders, hips, ankles)
+   - Torso angle and leg position analysis
 
-3. **Trajectory Prediction:**
-   - Attention-based temporal encoder architecture
-   - Multi-horizon prediction with uncertainty
-   - Social interaction modeling (if using GNN)
+3. **Grid-Based Conflict Detection:**
+   - Spatial grid division of camera feed
+   - Conflict zone definition (ego corridor)
+   - Two-rule conflict detection system:
+     - **Rule 1:** Person pose inclination → conflict probability
+     - **Rule 2:** Vehicle proximity + grid coverage → conflict probability
+   - Temporal smoothing for conflict scores
 
-4. **Conflict Detection:**
-   - Dynamic conflict zone definition
-   - TTC and PET computation
-   - Weak label generation with confidence weighting
-
-5. **Fusion Model:**
-   - Spatio-temporal vision encoder
-   - Kinematics encoder
-   - Cross-modal fusion strategies
-   - Multi-horizon prediction heads
-
-6. **Training Strategy:**
-   - Weakly-supervised learning with confidence weights
-   - Curriculum learning
-   - Data augmentation
+4. **Real-Time Processing:**
+   - Frame-by-frame processing pipeline
+   - GPU acceleration (MPS/CUDA)
+   - Real-time visualization and alerts
 
 ### Results Section:
 
-1. **Trajectory Prediction Performance:**
-   - ADE/FDE across horizons
-   - Comparison with baseline (linear extrapolation, constant velocity)
+1. **Conflict Detection Performance:**
+   - Precision/Recall/F1 for pedestrian conflicts
+   - Precision/Recall/F1 for vehicle conflicts
+   - Overall system accuracy
+   - Per-scenario breakdown
 
-2. **Conflict Prediction Performance:**
-   - Precision/Recall/F1 per horizon
-   - Lead-time metrics
-   - Calibration analysis
+2. **Pose Analysis Performance:**
+   - Torso angle detection accuracy
+   - Leg position classification accuracy
+   - Pose estimation reliability
 
-3. **Ablation Studies:**
-   - Component contributions
-   - Architecture choices
-   - Impact of trajectory prediction quality
+3. **Grid-Based Analysis:**
+   - Conflict zone localization accuracy
+   - Grid cell prediction accuracy
+   - Spatial resolution impact
 
-4. **Qualitative Results:**
-   - Visualization of successful predictions
+4. **Real-Time Performance:**
+   - Processing speed (FPS)
+   - Latency measurements
+   - Resource usage (GPU/CPU)
+
+5. **Qualitative Results:**
+   - Visualization of conflict detections
+   - Pose estimation examples
    - Failure case analysis
-   - Real-time inference examples
+   - Real-time inference demonstrations
 
 ### Limitations and Future Work:
 
@@ -937,15 +823,17 @@ loss = alpha * loss_hard + (1 - alpha) * T^2 * loss_soft
    - Image-space conflict detection (not true metric space)
    - Assumes static camera (ego-vehicle perspective)
    - Limited to monocular vision
-   - Weak labels may contain noise
+   - Pose estimation may fail in occlusion scenarios
+   - Grid-based approach is resolution-dependent
 
 2. **Future directions:**
    - Stereo/multi-camera fusion for depth estimation
-   - Metric-space TTC computation
+   - Metric-space conflict detection
    - Integration with LiDAR (if available)
-   - Active learning to refine weak labels
-   - Multi-agent scene understanding
-   - Long-term trajectory forecasting (5-10 seconds)
+   - Improved pose estimation for occluded scenarios
+   - Adaptive grid sizing based on scene complexity
+   - Multi-agent interaction modeling
+   - Machine learning refinement of conflict rules
 
 ---
 
@@ -966,11 +854,12 @@ loss = alpha * loss_hard + (1 - alpha) * T^2 * loss_soft
 
 ### Computational Resources:
 
-- **Training detector:** 1-2 days on single GPU (RTX 3090/4090)
-- **Trajectory extraction:** Depends on video length (can parallelize)
-- **Trajectory predictor training:** 4-8 hours
-- **Conflict predictor training:** 8-12 hours
-- **Full pipeline:** ~1 week for initial experiments
+- **YOLO12 inference:** Real-time on GPU (30+ FPS), 10-15 FPS on CPU
+- **Tracking:** Minimal overhead, real-time capable
+- **MediaPipe pose:** Real-time on CPU/GPU
+- **Conflict detection:** Real-time (negligible overhead)
+- **Full pipeline:** Real-time capable (30+ FPS on desktop GPU)
+- **Fine-tuning YOLO12 (optional):** 1-2 days on single GPU (RTX 3090/4090)
 
 ### Code Quality:
 
@@ -1009,14 +898,65 @@ mlmodel = convert_to_coreml(
 
 ---
 
+## Quick Start Guide
+
+### Step 1: Setup Environment
+```bash
+# Create virtual environment
+python3.9 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install --upgrade pip
+pip install torch torchvision torchaudio
+pip install ultralytics opencv-python mediapipe numpy scipy
+```
+
+### Step 2: Download YOLO12 Model
+```python
+from ultralytics import YOLO
+model = YOLO('yolo12n.pt')  # Automatically downloads if not present
+```
+
+### Step 3: Run Real-Time Conflict Detection
+```python
+from src.realtime_conflict_pipeline import RealtimeConflictPipeline
+
+# Initialize
+pipeline = RealtimeConflictPipeline(
+    yolo_model_path="yolo12n.pt",
+    grid_rows=8,
+    grid_cols=6
+)
+
+# Process webcam
+import cv2
+cap = cv2.VideoCapture(0)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    
+    result = pipeline.process_frame(frame)
+    vis_frame = pipeline.visualize(frame, result)
+    cv2.imshow('Conflict Detection', vis_frame)
+    
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+```
+
 ## Next Steps
 
-1. **Start with Phase 0-1:** Set up environment and train detector
-2. **Phase 2-3:** Implement trajectory extraction and prediction
-3. **Phase 4:** Build conflict detection pipeline
-4. **Phase 5-6:** Train fusion model
-5. **Phase 7:** Comprehensive evaluation
-6. **Phase 8:** Distillation and deployment preparation
-7. **Phase 9:** Documentation and paper writing
+1. **Phase 0-1:** Set up environment and configure YOLO12
+2. **Phase 2:** Implement trajectory extraction with MediaPipe
+3. **Phase 3:** Compute kinematics from trajectories (optional)
+4. **Phase 4:** Implement grid-based conflict detection
+5. **Phase 5:** Real-time pipeline integration
+6. **Phase 6:** Evaluation and metrics
+7. **Phase 7:** Documentation and results
 
-For detailed pseudocode or implementation help on specific phases, please specify which component you'd like to focus on next.
+For detailed implementation help on specific components, please specify which phase you'd like to focus on next.

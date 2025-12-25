@@ -1,0 +1,22 @@
+path: .
+
+train: data/rsud20k_train_500.txt
+val: rsud20k/images/val
+
+nc: 13
+names:
+  - person
+  - rickshaw
+  - rickshaw van
+  - auto rickshaw
+  - truck
+  - pickup truck
+  - private car
+  - motorcycle
+  - bicycle
+  - bus
+  - micro bus
+  - covered van
+  - human hauler
+
+
