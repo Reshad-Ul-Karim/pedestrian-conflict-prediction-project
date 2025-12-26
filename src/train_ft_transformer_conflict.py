@@ -8,7 +8,8 @@ warnings.filterwarnings('ignore')
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, cohen_kappa_score, f1_score, recall_score
+from sklearn.metrics import classification_report, confusion_matrix, mean_squared_error, mean_absolute_error, r2_score, cohen_kappa_score, f1_score, recall_score, accuracy_score, precision_score, roc_auc_score, roc_curve
+from sklearn.preprocessing import label_binarize
 from scipy.optimize import minimize_scalar
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -1142,68 +1143,177 @@ def score_to_level(scores, low=0.35, high=0.65):
 y_true_class = score_to_level(y_test, low=opt_low, high=opt_high)
 y_pred_class = score_to_level(y_pred, low=opt_low, high=opt_high)
 
-print(f"\nClassification Report:")
-print(classification_report(y_true_class, y_pred_class, target_names=['LOW', 'MED', 'HIGH']))
+# Store predictions for all models
+all_class_predictions = {}
+all_class_predictions['FT-Transformer'] = y_pred_class
 
-kappa = cohen_kappa_score(y_true_class, y_pred_class)
-macro_f1 = f1_score(y_true_class, y_pred_class, average='macro', zero_division=0)
-print(f"\n  Cohen's Kappa: {kappa:.4f}")
-print(f"  Macro F1: {macro_f1:.4f}")
+# Initialize ROC-AUC scores storage
+roc_auc_scores = {}
+
+# Calculate comprehensive classification metrics for FT-Transformer
+accuracy_ft = accuracy_score(y_true_class, y_pred_class)
+precision_ft = precision_score(y_true_class, y_pred_class, average=None, zero_division=0, labels=['LOW', 'MED', 'HIGH'])
+recall_ft = recall_score(y_true_class, y_pred_class, average=None, zero_division=0, labels=['LOW', 'MED', 'HIGH'])
+f1_ft = f1_score(y_true_class, y_pred_class, average=None, zero_division=0, labels=['LOW', 'MED', 'HIGH'])
+macro_precision_ft = precision_score(y_true_class, y_pred_class, average='macro', zero_division=0)
+macro_recall_ft = recall_score(y_true_class, y_pred_class, average='macro', zero_division=0)
+macro_f1_ft = f1_score(y_true_class, y_pred_class, average='macro', zero_division=0)
+weighted_f1_ft = f1_score(y_true_class, y_pred_class, average='weighted', zero_division=0)
+kappa_ft = cohen_kappa_score(y_true_class, y_pred_class)
+
+print("\n" + "="*60)
+print("FT-Transformer Classification Report")
+print("="*60)
+print(f"\nAccuracy: {accuracy_ft:.4f}")
+print(f"\nPer-Class Metrics:")
+print(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'F1-Score':<12}")
+print("-" * 46)
+for i, cls in enumerate(['LOW', 'MED', 'HIGH']):
+    print(f"{cls:<10} {precision_ft[i]:<12.4f} {recall_ft[i]:<12.4f} {f1_ft[i]:<12.4f}")
+print(f"\nMacro Average:")
+print(f"  Precision: {macro_precision_ft:.4f}")
+print(f"  Recall: {macro_recall_ft:.4f}")
+print(f"  F1-Score: {macro_f1_ft:.4f}")
+print(f"\nWeighted F1-Score: {weighted_f1_ft:.4f}")
+print(f"Cohen's Kappa: {kappa_ft:.4f}")
+
+print(f"\nDetailed Classification Report:")
+print(classification_report(y_true_class, y_pred_class, target_names=['LOW', 'MED', 'HIGH'], digits=4))
 
 # Store FT-Transformer classification metrics
-all_metrics['FT-Transformer']['kappa'] = kappa
-all_metrics['FT-Transformer']['macro_f1'] = macro_f1
+all_metrics['FT-Transformer']['accuracy'] = accuracy_ft
+all_metrics['FT-Transformer']['precision'] = {cls: float(precision_ft[i]) for i, cls in enumerate(['LOW', 'MED', 'HIGH'])}
+all_metrics['FT-Transformer']['recall'] = {cls: float(recall_ft[i]) for i, cls in enumerate(['LOW', 'MED', 'HIGH'])}
+all_metrics['FT-Transformer']['f1'] = {cls: float(f1_ft[i]) for i, cls in enumerate(['LOW', 'MED', 'HIGH'])}
+all_metrics['FT-Transformer']['macro_precision'] = macro_precision_ft
+all_metrics['FT-Transformer']['macro_recall'] = macro_recall_ft
+all_metrics['FT-Transformer']['macro_f1'] = macro_f1_ft
+all_metrics['FT-Transformer']['weighted_f1'] = weighted_f1_ft
+all_metrics['FT-Transformer']['kappa'] = kappa_ft
 all_metrics['FT-Transformer']['thresholds'] = {'low': float(opt_low), 'high': float(opt_high)}
 
-# Evaluate XGBoost and CatBoost with same thresholds
+# Evaluate XGBoost with same thresholds
 if TRAIN_XGBOOST and xgb_model is not None:
     y_pred_xgb_class = score_to_level(all_predictions['XGBoost'], low=opt_low, high=opt_high)
-    kappa_xgb = cohen_kappa_score(y_true_class, y_pred_xgb_class)
+    all_class_predictions['XGBoost'] = y_pred_xgb_class
+    
+    accuracy_xgb = accuracy_score(y_true_class, y_pred_xgb_class)
+    precision_xgb = precision_score(y_true_class, y_pred_xgb_class, average=None, zero_division=0, labels=['LOW', 'MED', 'HIGH'])
+    recall_xgb = recall_score(y_true_class, y_pred_xgb_class, average=None, zero_division=0, labels=['LOW', 'MED', 'HIGH'])
+    f1_xgb = f1_score(y_true_class, y_pred_xgb_class, average=None, zero_division=0, labels=['LOW', 'MED', 'HIGH'])
+    macro_precision_xgb = precision_score(y_true_class, y_pred_xgb_class, average='macro', zero_division=0)
+    macro_recall_xgb = recall_score(y_true_class, y_pred_xgb_class, average='macro', zero_division=0)
     macro_f1_xgb = f1_score(y_true_class, y_pred_xgb_class, average='macro', zero_division=0)
+    weighted_f1_xgb = f1_score(y_true_class, y_pred_xgb_class, average='weighted', zero_division=0)
+    kappa_xgb = cohen_kappa_score(y_true_class, y_pred_xgb_class)
     
-    all_metrics['XGBoost']['kappa'] = kappa_xgb
+    print("\n" + "="*60)
+    print("XGBoost Classification Report")
+    print("="*60)
+    print(f"\nAccuracy: {accuracy_xgb:.4f}")
+    print(f"\nPer-Class Metrics:")
+    print(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'F1-Score':<12}")
+    print("-" * 46)
+    for i, cls in enumerate(['LOW', 'MED', 'HIGH']):
+        print(f"{cls:<10} {precision_xgb[i]:<12.4f} {recall_xgb[i]:<12.4f} {f1_xgb[i]:<12.4f}")
+    print(f"\nMacro Average:")
+    print(f"  Precision: {macro_precision_xgb:.4f}")
+    print(f"  Recall: {macro_recall_xgb:.4f}")
+    print(f"  F1-Score: {macro_f1_xgb:.4f}")
+    print(f"\nWeighted F1-Score: {weighted_f1_xgb:.4f}")
+    print(f"Cohen's Kappa: {kappa_xgb:.4f}")
+    
+    print(f"\nDetailed Classification Report:")
+    print(classification_report(y_true_class, y_pred_xgb_class, target_names=['LOW', 'MED', 'HIGH'], digits=4))
+    
+    all_metrics['XGBoost']['accuracy'] = accuracy_xgb
+    all_metrics['XGBoost']['precision'] = {cls: float(precision_xgb[i]) for i, cls in enumerate(['LOW', 'MED', 'HIGH'])}
+    all_metrics['XGBoost']['recall'] = {cls: float(recall_xgb[i]) for i, cls in enumerate(['LOW', 'MED', 'HIGH'])}
+    all_metrics['XGBoost']['f1'] = {cls: float(f1_xgb[i]) for i, cls in enumerate(['LOW', 'MED', 'HIGH'])}
+    all_metrics['XGBoost']['macro_precision'] = macro_precision_xgb
+    all_metrics['XGBoost']['macro_recall'] = macro_recall_xgb
     all_metrics['XGBoost']['macro_f1'] = macro_f1_xgb
+    all_metrics['XGBoost']['weighted_f1'] = weighted_f1_xgb
+    all_metrics['XGBoost']['kappa'] = kappa_xgb
     all_metrics['XGBoost']['thresholds'] = {'low': float(opt_low), 'high': float(opt_high)}
-    
-    print(f"\nClassification Metrics (XGBoost):")
-    print(f"  Cohen's Kappa: {kappa_xgb:.4f}")
-    print(f"  Macro F1: {macro_f1_xgb:.4f}")
 
+# Evaluate CatBoost with same thresholds
 if TRAIN_CATBOOST and catboost_model is not None:
     y_pred_cb_class = score_to_level(all_predictions['CatBoost'], low=opt_low, high=opt_high)
-    kappa_cb = cohen_kappa_score(y_true_class, y_pred_cb_class)
+    all_class_predictions['CatBoost'] = y_pred_cb_class
+    
+    accuracy_cb = accuracy_score(y_true_class, y_pred_cb_class)
+    precision_cb = precision_score(y_true_class, y_pred_cb_class, average=None, zero_division=0, labels=['LOW', 'MED', 'HIGH'])
+    recall_cb = recall_score(y_true_class, y_pred_cb_class, average=None, zero_division=0, labels=['LOW', 'MED', 'HIGH'])
+    f1_cb = f1_score(y_true_class, y_pred_cb_class, average=None, zero_division=0, labels=['LOW', 'MED', 'HIGH'])
+    macro_precision_cb = precision_score(y_true_class, y_pred_cb_class, average='macro', zero_division=0)
+    macro_recall_cb = recall_score(y_true_class, y_pred_cb_class, average='macro', zero_division=0)
     macro_f1_cb = f1_score(y_true_class, y_pred_cb_class, average='macro', zero_division=0)
+    weighted_f1_cb = f1_score(y_true_class, y_pred_cb_class, average='weighted', zero_division=0)
+    kappa_cb = cohen_kappa_score(y_true_class, y_pred_cb_class)
     
-    all_metrics['CatBoost']['kappa'] = kappa_cb
+    print("\n" + "="*60)
+    print("CatBoost Classification Report")
+    print("="*60)
+    print(f"\nAccuracy: {accuracy_cb:.4f}")
+    print(f"\nPer-Class Metrics:")
+    print(f"{'Class':<10} {'Precision':<12} {'Recall':<12} {'F1-Score':<12}")
+    print("-" * 46)
+    for i, cls in enumerate(['LOW', 'MED', 'HIGH']):
+        print(f"{cls:<10} {precision_cb[i]:<12.4f} {recall_cb[i]:<12.4f} {f1_cb[i]:<12.4f}")
+    print(f"\nMacro Average:")
+    print(f"  Precision: {macro_precision_cb:.4f}")
+    print(f"  Recall: {macro_recall_cb:.4f}")
+    print(f"  F1-Score: {macro_f1_cb:.4f}")
+    print(f"\nWeighted F1-Score: {weighted_f1_cb:.4f}")
+    print(f"Cohen's Kappa: {kappa_cb:.4f}")
+    
+    print(f"\nDetailed Classification Report:")
+    print(classification_report(y_true_class, y_pred_cb_class, target_names=['LOW', 'MED', 'HIGH'], digits=4))
+    
+    all_metrics['CatBoost']['accuracy'] = accuracy_cb
+    all_metrics['CatBoost']['precision'] = {cls: float(precision_cb[i]) for i, cls in enumerate(['LOW', 'MED', 'HIGH'])}
+    all_metrics['CatBoost']['recall'] = {cls: float(recall_cb[i]) for i, cls in enumerate(['LOW', 'MED', 'HIGH'])}
+    all_metrics['CatBoost']['f1'] = {cls: float(f1_cb[i]) for i, cls in enumerate(['LOW', 'MED', 'HIGH'])}
+    all_metrics['CatBoost']['macro_precision'] = macro_precision_cb
+    all_metrics['CatBoost']['macro_recall'] = macro_recall_cb
     all_metrics['CatBoost']['macro_f1'] = macro_f1_cb
+    all_metrics['CatBoost']['weighted_f1'] = weighted_f1_cb
+    all_metrics['CatBoost']['kappa'] = kappa_cb
     all_metrics['CatBoost']['thresholds'] = {'low': float(opt_low), 'high': float(opt_high)}
-    
-    print(f"\nClassification Metrics (CatBoost):")
-    print(f"  Cohen's Kappa: {kappa_cb:.4f}")
-    print(f"  Macro F1: {macro_f1_cb:.4f}")
 
 # Classification Comparison Summary
-if len([m for m in all_metrics.keys() if 'kappa' in all_metrics[m]]) > 1:
+if len([m for m in all_metrics.keys() if 'accuracy' in all_metrics[m]]) > 1:
     print("\n" + "="*60)
     print("Classification Metrics Comparison")
     print("="*60)
     
     cls_comparison = pd.DataFrame({
         model: {
-            'Kappa': all_metrics[model].get('kappa', 0),
-            'Macro F1': all_metrics[model].get('macro_f1', 0)
+            'Accuracy': all_metrics[model].get('accuracy', 0),
+            'Macro Precision': all_metrics[model].get('macro_precision', 0),
+            'Macro Recall': all_metrics[model].get('macro_recall', 0),
+            'Macro F1': all_metrics[model].get('macro_f1', 0),
+            'Weighted F1': all_metrics[model].get('weighted_f1', 0),
+            'Kappa': all_metrics[model].get('kappa', 0)
         }
-        for model in all_metrics.keys() if 'kappa' in all_metrics[model]
+        for model in all_metrics.keys() if 'accuracy' in all_metrics[model]
     }).T
     
-    print("\nClassification Metrics:")
+    print("\nClassification Metrics Comparison:")
     print(cls_comparison.round(4))
     
     print("\nBest Model per Classification Metric:")
-    best_kappa_model = cls_comparison['Kappa'].idxmax()
+    best_acc_model = cls_comparison['Accuracy'].idxmax()
+    best_prec_model = cls_comparison['Macro Precision'].idxmax()
+    best_recall_model = cls_comparison['Macro Recall'].idxmax()
     best_f1_model = cls_comparison['Macro F1'].idxmax()
-    print(f"  Kappa: {best_kappa_model} ({cls_comparison.loc[best_kappa_model, 'Kappa']:.4f})")
+    best_kappa_model = cls_comparison['Kappa'].idxmax()
+    print(f"  Accuracy: {best_acc_model} ({cls_comparison.loc[best_acc_model, 'Accuracy']:.4f})")
+    print(f"  Macro Precision: {best_prec_model} ({cls_comparison.loc[best_prec_model, 'Macro Precision']:.4f})")
+    print(f"  Macro Recall: {best_recall_model} ({cls_comparison.loc[best_recall_model, 'Macro Recall']:.4f})")
     print(f"  Macro F1: {best_f1_model} ({cls_comparison.loc[best_f1_model, 'Macro F1']:.4f})")
+    print(f"  Kappa: {best_kappa_model} ({cls_comparison.loc[best_kappa_model, 'Kappa']:.4f})")
 
 # Plot results
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -1311,16 +1421,222 @@ if len(all_predictions) > 1:
     print("✓ Model comparison plots saved to /content/model_comparison.png")
     plt.show()
 
-# Confusion matrix
-cm = confusion_matrix(y_true_class, y_pred_class)
-plt.figure(figsize=(6, 5))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['LOW', 'MED', 'HIGH'], yticklabels=['LOW', 'MED', 'HIGH'])
-plt.title('Confusion Matrix')
-plt.ylabel('True')
-plt.xlabel('Predicted')
+# Normalized Confusion Matrices for All Models
+print("\n" + "="*60)
+print("Normalized Confusion Matrices")
+print("="*60)
+
+# Create figure with subplots for all models
+n_models = len(all_class_predictions)
+fig, axes = plt.subplots(1, n_models, figsize=(6*n_models, 5))
+if n_models == 1:
+    axes = [axes]
+
+for idx, (model_name, y_pred_model_class) in enumerate(all_class_predictions.items()):
+    cm = confusion_matrix(y_true_class, y_pred_model_class, labels=['LOW', 'MED', 'HIGH'])
+    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    cm_normalized = np.nan_to_num(cm_normalized)  # Handle division by zero
+    
+    sns.heatmap(cm_normalized, annot=True, fmt='.3f', cmap='Blues', 
+                xticklabels=['LOW', 'MED', 'HIGH'], 
+                yticklabels=['LOW', 'MED', 'HIGH'],
+                ax=axes[idx], vmin=0, vmax=1, cbar_kws={'label': 'Normalized'})
+    axes[idx].set_title(f'{model_name} - Normalized Confusion Matrix')
+    axes[idx].set_ylabel('True Label')
+    axes[idx].set_xlabel('Predicted Label')
+
 plt.tight_layout()
-plt.savefig('/content/confusion_matrix.png', dpi=200, bbox_inches='tight')
+plt.savefig('/content/normalized_confusion_matrices.png', dpi=200, bbox_inches='tight')
+print("✓ Normalized confusion matrices saved to /content/normalized_confusion_matrices.png")
 plt.show()
+
+# Also save individual confusion matrices
+for model_name, y_pred_model_class in all_class_predictions.items():
+    cm = confusion_matrix(y_true_class, y_pred_model_class, labels=['LOW', 'MED', 'HIGH'])
+    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    cm_normalized = np.nan_to_num(cm_normalized)
+    
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm_normalized, annot=True, fmt='.3f', cmap='Blues',
+                xticklabels=['LOW', 'MED', 'HIGH'], 
+                yticklabels=['LOW', 'MED', 'HIGH'],
+                vmin=0, vmax=1, cbar_kws={'label': 'Normalized'})
+    plt.title(f'{model_name} - Normalized Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    safe_model_name = model_name.replace(' ', '_').lower()
+    plt.savefig(f'/content/confusion_matrix_{safe_model_name}.png', dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"✓ {model_name} confusion matrix saved to /content/confusion_matrix_{safe_model_name}.png")
+
+# ROC-AUC Curves Comparison
+print("\n" + "="*60)
+print("ROC-AUC Curves Comparison")
+print("="*60)
+
+# Convert class labels to numeric for ROC-AUC
+label_to_num = {'LOW': 0, 'MED': 1, 'HIGH': 2}
+y_true_numeric = np.array([label_to_num[label] for label in y_true_class])
+
+# Binarize labels for multi-class ROC-AUC
+y_true_binarized = label_binarize(y_true_numeric, classes=[0, 1, 2])
+
+# Create figure for ROC-AUC curves
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+# Plot 1: Aggregated Multi-class ROC-AUC (Macro-Averaged, One per Model)
+ax1 = axes[0]
+colors_map = {'FT-Transformer': 'blue', 'XGBoost': 'green', 'CatBoost': 'orange'}
+class_names = ['LOW', 'MED', 'HIGH']
+
+for model_name, y_pred_model in all_predictions.items():
+    # Convert regression predictions to probabilities for each class
+    # Use softmax-like transformation based on distance to thresholds
+    prob_matrix = np.zeros((len(y_pred_model), 3))
+    
+    for i, score in enumerate(y_pred_model):
+        # Calculate probabilities based on distance to thresholds
+        if score <= opt_low:
+            prob_matrix[i, 0] = 1.0 - (score / opt_low) * 0.5  # LOW probability
+            prob_matrix[i, 1] = (score / opt_low) * 0.5  # MED probability
+            prob_matrix[i, 2] = 0.0  # HIGH probability
+        elif score <= opt_high:
+            prob_matrix[i, 0] = 0.0
+            prob_matrix[i, 1] = 1.0 - abs(score - (opt_low + opt_high) / 2) / ((opt_high - opt_low) / 2) * 0.5
+            prob_matrix[i, 2] = abs(score - (opt_low + opt_high) / 2) / ((opt_high - opt_low) / 2) * 0.5
+        else:
+            prob_matrix[i, 0] = 0.0
+            prob_matrix[i, 1] = (1.0 - (score - opt_high) / (1.0 - opt_high)) * 0.5
+            prob_matrix[i, 2] = 1.0 - (1.0 - (score - opt_high) / (1.0 - opt_high)) * 0.5
+    
+    # Normalize probabilities
+    prob_matrix = prob_matrix / (prob_matrix.sum(axis=1, keepdims=True) + 1e-10)
+    
+    # Calculate ROC-AUC for each class and compute macro-averaged ROC curve
+    roc_auc_per_class = {}
+    all_fpr = []
+    all_tpr = []
+    
+    for i, class_name in enumerate(class_names):
+        if y_true_binarized[:, i].sum() > 0:  # Check if class exists in test set
+            try:
+                roc_auc = roc_auc_score(y_true_binarized[:, i], prob_matrix[:, i])
+                roc_auc_per_class[class_name] = roc_auc
+                
+                # Get ROC curve for this class
+                fpr, tpr, _ = roc_curve(y_true_binarized[:, i], prob_matrix[:, i])
+                all_fpr.append(fpr)
+                all_tpr.append(tpr)
+            except:
+                pass
+    
+    # Compute macro-averaged ROC curve (average across all classes)
+    if all_fpr and all_tpr:
+        # Interpolate all ROC curves to common FPR points
+        mean_fpr = np.linspace(0, 1, 100)
+        mean_tpr = np.zeros_like(mean_fpr)
+        
+        for fpr, tpr in zip(all_fpr, all_tpr):
+            # Interpolate TPR at common FPR points
+            mean_tpr += np.interp(mean_fpr, fpr, tpr)
+        
+        # Average across all classes
+        mean_tpr /= len(all_fpr)
+        
+        # Calculate macro-averaged AUC
+        macro_roc_auc = np.mean(list(roc_auc_per_class.values()))
+        
+        # Plot aggregated ROC curve (one per model)
+        ax1.plot(mean_fpr, mean_tpr, lw=2, 
+                label=f'{model_name} (Macro AUC={macro_roc_auc:.3f})',
+                color=colors_map.get(model_name, 'gray'))
+        
+        roc_auc_scores[model_name] = {
+            'per_class': roc_auc_per_class,
+            'macro': macro_roc_auc
+        }
+        print(f"\n{model_name} ROC-AUC:")
+        for cls, score in roc_auc_per_class.items():
+            print(f"  {cls}: {score:.4f}")
+        print(f"  Macro Average: {macro_roc_auc:.4f}")
+
+ax1.plot([0, 1], [0, 1], 'k--', lw=2, label='Random (AUC=0.5)')
+ax1.set_xlabel('False Positive Rate')
+ax1.set_ylabel('True Positive Rate')
+ax1.set_title('Multi-Class ROC Curves (Macro-Averaged, One per Model)')
+ax1.legend(loc='lower right')
+ax1.grid(True, alpha=0.3)
+
+# Plot 2: Binary ROC-AUC (HIGH vs Not-HIGH)
+ax2 = axes[1]
+y_true_binary = (y_true_numeric == 2).astype(int)  # HIGH = 1, Not-HIGH = 0
+
+for model_name, y_pred_model in all_predictions.items():
+    # Convert regression predictions to probability of HIGH class
+    # Use sigmoid-like transformation
+    y_pred_binary_prob = 1 / (1 + np.exp(-10 * (y_pred_model - opt_high)))
+    
+    try:
+        roc_auc_binary = roc_auc_score(y_true_binary, y_pred_binary_prob)
+        fpr, tpr, _ = roc_curve(y_true_binary, y_pred_binary_prob)
+        ax2.plot(fpr, tpr, lw=2, 
+                label=f'{model_name} (AUC={roc_auc_binary:.3f})',
+                color=colors_map.get(model_name, 'gray'))
+        
+        if 'binary' not in roc_auc_scores.get(model_name, {}):
+            roc_auc_scores[model_name] = roc_auc_scores.get(model_name, {})
+        roc_auc_scores[model_name]['binary'] = roc_auc_binary
+    except Exception as e:
+        print(f"⚠ Error calculating binary ROC-AUC for {model_name}: {e}")
+
+ax2.plot([0, 1], [0, 1], 'k--', lw=2, label='Random (AUC=0.5)')
+ax2.set_xlabel('False Positive Rate')
+ax2.set_ylabel('True Positive Rate')
+ax2.set_title('Binary ROC Curves (HIGH vs Not-HIGH)')
+ax2.legend(loc='lower right')
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('/content/roc_auc_curves.png', dpi=200, bbox_inches='tight')
+print("\n✓ ROC-AUC curves saved to /content/roc_auc_curves.png")
+plt.show()
+
+# Print ROC-AUC comparison
+if len(roc_auc_scores) > 1:
+    print("\n" + "="*60)
+    print("ROC-AUC Comparison")
+    print("="*60)
+    
+    roc_comparison = pd.DataFrame({
+        model: {
+            'LOW': roc_auc_scores[model].get('per_class', {}).get('LOW', 0),
+            'MED': roc_auc_scores[model].get('per_class', {}).get('MED', 0),
+            'HIGH': roc_auc_scores[model].get('per_class', {}).get('HIGH', 0),
+            'Macro Average': roc_auc_scores[model].get('macro', 0),
+            'Binary (HIGH vs Not-HIGH)': roc_auc_scores[model].get('binary', 0)
+        }
+        for model in roc_auc_scores.keys()
+    }).T
+    
+    print("\nROC-AUC Scores:")
+    print(roc_comparison.round(4))
+    
+    print("\nBest Model per ROC-AUC Metric:")
+    for metric in ['LOW', 'MED', 'HIGH', 'Macro Average', 'Binary (HIGH vs Not-HIGH)']:
+        if metric in roc_comparison.columns:
+            best_model = roc_comparison[metric].idxmax()
+            best_value = roc_comparison.loc[best_model, metric]
+            print(f"  {metric}: {best_model} ({best_value:.4f})")
+    
+    # Store ROC-AUC scores in metrics
+    for model_name in roc_auc_scores.keys():
+        if model_name in all_metrics:
+            all_metrics[model_name]['roc_auc'] = {
+                'per_class': {k: float(v) for k, v in roc_auc_scores[model_name].get('per_class', {}).items()},
+                'macro': float(roc_auc_scores[model_name].get('macro', 0)),
+                'binary': float(roc_auc_scores[model_name].get('binary', 0))
+            }
 
 # Feature Importance Analysis for LOW Class Misclassifications
 print("\n" + "="*60)
@@ -1524,8 +1840,8 @@ metrics = {
     'rmse': float(rmse),
     'mae': float(mae),
     'r2': float(r2),
-    'kappa': float(kappa),
-    'macro_f1': float(macro_f1),
+    'kappa': float(kappa_ft),
+    'macro_f1': float(macro_f1_ft),
     'optimized_thresholds': {
         'low': float(opt_low),
         'high': float(opt_high),
@@ -1588,8 +1904,9 @@ print(f"✓ Best Metrics:")
 print(f"    - RMSE: {rmse:.4f}")
 print(f"    - MAE: {mae:.4f}")
 print(f"    - R²: {r2:.4f}")
-print(f"    - Cohen's Kappa: {kappa:.4f}")
-print(f"    - Macro F1: {macro_f1:.4f}")
+if 'FT-Transformer' in all_metrics and 'kappa' in all_metrics['FT-Transformer']:
+    print(f"    - Cohen's Kappa: {all_metrics['FT-Transformer']['kappa']:.4f}")
+    print(f"    - Macro F1: {all_metrics['FT-Transformer']['macro_f1']:.4f}")
 print(f"✓ Optimized Thresholds:")
 print(f"    - LOW ≤ {opt_low:.3f}")
 print(f"    - MED: {opt_low:.3f} - {opt_high:.3f}")
@@ -1602,9 +1919,15 @@ print(f"✓ Metrics saved to: /content/metrics.json")
 print(f"✓ Plots saved to:")
 print(f"    - /content/training_curves.png (loss & MSE curves)")
 print(f"    - /content/training_results.png (predictions & distributions)")
-print(f"    - /content/confusion_matrix.png (classification matrix)")
+print(f"    - /content/normalized_confusion_matrices.png (normalized confusion matrices)")
+if len(all_class_predictions) > 0:
+    for model_name in all_class_predictions.keys():
+        safe_name = model_name.replace(' ', '_').lower()
+        print(f"    - /content/confusion_matrix_{safe_name}.png ({model_name} confusion matrix)")
 if len(all_predictions) > 1:
     print(f"    - /content/model_comparison.png (model comparison plots)")
+if len(roc_auc_scores) > 0:
+    print(f"    - /content/roc_auc_curves.png (ROC-AUC curves comparison)")
 print(f"\n✓ Models Trained:")
 print(f"    - FT-Transformer: {'✓' if 'FT-Transformer' in all_models else '✗'}")
 print(f"    - XGBoost: {'✓' if TRAIN_XGBOOST and 'XGBoost' in all_models else '✗'}")
