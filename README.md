@@ -9,6 +9,7 @@ This research project implements a **novel, state-of-the-art framework** for pre
 - **YOLO13n person detection** with ground truth integration from RSUD20K
 - **MediaPipe pose estimation** for advanced pedestrian pose analysis
 - **FT-Transformer** for tabular conflict risk prediction with ensemble uncertainty quantification
+- **XGBoost and CatBoost** for baseline comparison and model benchmarking
 - **Comprehensive feature engineering** including spatial relationships, scene context, and multi-scale features
 - **Explainable AI (XAI)** for rigorous model interpretation and validation
 
@@ -335,7 +336,7 @@ python src/generate_conflict_dataset_csv.py
 
 ---
 
-## Phase 5: Model Training
+## Phase 5: Model Training and Comparison
 
 ### Step 5.1: FT-Transformer Architecture
 
@@ -354,17 +355,17 @@ python src/generate_conflict_dataset_csv.py
 - **Preprocessing**: StandardScaler, feature normalization
 - **Hyperparameters**: Grid search over learning rate, heads, embedding dim, batch size
 - **Regularization**: Dropout, weight decay, early stopping, learning rate scheduling
-- **Ensemble**: Optional ensemble of 3 models for uncertainty quantification
+- **Ensemble**: Optional ensemble of 2 models for uncertainty quantification
 
 **Anti-Overfitting Measures:**
-1. **Dropout**: `attn_dropout=0.1`, `ff_dropout=0.1`
+1. **Dropout**: `attn_dropout=0.1`, `ff_dropout=0.1`, `embedding_dropout=0.05`
 2. **Weight Decay**: L2 regularization (1e-4)
 3. **Early Stopping**: Patience=15, min_delta=1e-5
 4. **Learning Rate Scheduler**: ReduceLROnPlateau
 5. **Reduced Model Complexity**: Smaller default architecture
 6. **Increased Validation Data**: 70/30 split (was 80/20)
 7. **Class Weighting**: Inverse frequency weighting for imbalanced classes
-8. **Threshold Optimization**: Automatic LOW/MED/HIGH threshold finding
+8. **Threshold Optimization**: Automatic LOW/MED/HIGH threshold finding with class weights and recall focus
 
 **Usage:**
 ```bash
@@ -380,7 +381,7 @@ python src/train_ft_transformer_conflict.py
 ### Step 5.2: Ensemble Methods
 
 **Uncertainty Quantification:**
-- Train 3 models with different random seeds
+- Train 2 models with different random seeds
 - Ensemble predictions: mean, std, confidence intervals
 - Provides prediction uncertainty
 
@@ -388,14 +389,113 @@ python src/train_ft_transformer_conflict.py
 ```python
 # In train_ft_transformer_conflict.py
 USE_ENSEMBLE = True
-ENSEMBLE_SIZE = 3
+ENSEMBLE_SIZE = 2
 
 # Ensemble provides:
 # - mean_prediction
-# - prediction_std
+# - prediction_std (uncertainty as standard deviation across models)
 # - prediction_lower_bound (95% CI)
 # - prediction_upper_bound (95% CI)
 ```
+
+### Step 5.3: XGBoost Baseline
+
+**Model: XGBoost (Gradient Boosting)**
+
+**Training Configuration:**
+- **Objective**: `reg:squarederror`
+- **Max Depth**: 6
+- **Learning Rate**: 0.1
+- **N Estimators**: 200
+- **Subsample**: 0.8
+- **Colsample by Tree**: 0.8
+- **Early Stopping**: 20 rounds patience
+- **Same Data Splits**: Uses identical train/val/test splits as FT-Transformer
+
+**Features:**
+- Gradient boosting with tree-based learners
+- Handles non-linear relationships effectively
+- Fast training and inference
+- Built-in feature importance
+
+**Output:**
+- Trained model: `outputs/models/ft_transformer/xgboost_model.json`
+- Metrics included in comparison report
+
+### Step 5.4: CatBoost Baseline
+
+**Model: CatBoost (Gradient Boosting)**
+
+**Training Configuration:**
+- **Loss Function**: RMSE
+- **Depth**: 6
+- **Learning Rate**: 0.1
+- **Iterations**: 200
+- **L2 Leaf Reg**: 3
+- **Early Stopping**: 20 rounds patience
+- **Same Data Splits**: Uses identical train/val/test splits as FT-Transformer
+
+**Features:**
+- Advanced gradient boosting with categorical handling
+- Robust to overfitting
+- Automatic feature interactions
+- Built-in feature importance
+
+**Output:**
+- Trained model: `outputs/models/ft_transformer/catboost_model.cbm`
+- Metrics included in comparison report
+
+### Step 5.5: Model Comparison
+
+**Comprehensive Comparison:**
+
+The training script automatically trains and compares all three models:
+
+1. **Regression Metrics Comparison:**
+   - MSE, RMSE, MAE, R² for all models
+   - Best model identification per metric
+   - Side-by-side comparison tables
+
+2. **Classification Metrics Comparison:**
+   - Uses same optimized thresholds for all models
+   - Cohen's Kappa and Macro F1-score
+   - Per-class precision, recall, F1
+   - Best model identification per classification metric
+
+3. **Visual Comparison:**
+   - **Predictions vs True Values**: Scatter plots for all models
+   - **Residuals Plot**: Residual analysis comparison
+   - **Metrics Bar Chart**: Side-by-side metric comparison
+   - **Distribution Comparison**: Prediction distributions vs true distribution
+
+4. **Model Saving:**
+   - All models saved to `outputs/models/ft_transformer/`
+   - FT-Transformer: `.ckpt` format
+   - XGBoost: `.json` format (with `.pkl` fallback)
+   - CatBoost: `.cbm` format (with `.pkl` fallback)
+
+5. **Metrics Saving:**
+   - Individual metrics: `outputs/metrics.json` (FT-Transformer)
+   - Comparison metrics: `outputs/model_comparison_metrics.json` (all models)
+
+**Usage:**
+```python
+# In train_ft_transformer_conflict.py
+TRAIN_XGBOOST = True  # Enable XGBoost training
+TRAIN_CATBOOST = True  # Enable CatBoost training
+
+# All models use same:
+# - Train/val/test splits
+# - Feature preprocessing
+# - Evaluation metrics
+# - Threshold optimization
+```
+
+**Comparison Output:**
+- Model comparison summary tables
+- Best model per metric identification
+- Comprehensive comparison plots (`model_comparison.png`)
+- All models saved for future use
 
 ---
 
@@ -723,9 +823,12 @@ xai.generate_report(output_dir='outputs/xai_report/')
    - Spatial relationships, scene context, multi-scale features
    - Interaction features for non-linearity
 
-3. **FT-Transformer for Conflict Prediction**:
-   - Transformer-based architecture for tabular data
+3. **Model Training and Comparison**:
+   - FT-Transformer: Transformer-based architecture for tabular data
+   - XGBoost: Gradient boosting baseline
+   - CatBoost: Advanced gradient boosting baseline
    - Ensemble methods for uncertainty quantification
+   - Comprehensive model comparison with same evaluation protocol
    - Anti-overfitting measures
 
 4. **Explainable AI Framework**:
@@ -768,8 +871,13 @@ xai.generate_report(output_dir='outputs/xai_report/')
 - [x] Comprehensive feature extraction (50+ features)
 - [x] CSV dataset generation
 - [x] FT-Transformer training pipeline
-- [x] Ensemble methods for uncertainty
+- [x] XGBoost baseline training
+- [x] CatBoost baseline training
+- [x] Model comparison framework
+- [x] Ensemble methods for uncertainty quantification
 - [x] Anti-overfitting measures
+- [x] Class weighting and threshold optimization
+- [x] Feature importance analysis (SHAP)
 
 ### In Progress 🚧
 
@@ -850,12 +958,14 @@ python src/generate_conflict_dataset_csv.py
 # ~35,000+ rows with 50+ features
 ```
 
-### Step 4: Train Model
+### Step 4: Train Models
 
 ```bash
 python src/train_ft_transformer_conflict.py
-# Trains FT-Transformer with ensemble
-# Saves to outputs/models/ft_transformer/
+# Trains FT-Transformer, XGBoost, and CatBoost
+# Compares all models with same evaluation protocol
+# Saves all models to outputs/models/ft_transformer/
+# Generates comparison plots and metrics
 ```
 
 ### Step 5: Run XAI Analysis (To be implemented)
@@ -889,6 +999,8 @@ python src/visualize_conflict_risk.py \
 - Ultralytics YOLO (YOLO13n/YOLO12n)
 - Transformers (SegFormer)
 - PyTorch Tabular (FT-Transformer)
+- XGBoost (gradient boosting)
+- CatBoost (gradient boosting)
 - MediaPipe (pose estimation)
 
 **XAI (To be installed):**
@@ -955,4 +1067,4 @@ For questions or issues, please refer to:
 ---
 
 **Last Updated**: 2024
-**Status**: Active Development - XAI Implementation Phase
+**Status**: Active Development - Model Comparison Complete, XAI Implementation Phase
