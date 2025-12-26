@@ -136,34 +136,149 @@ if all(col in df.columns for col in ['bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2',
 if 'pose_detected' in df.columns and df['pose_detected'].dtype == 'bool':
     df['pose_detected'] = df['pose_detected'].astype(int)
 
-# Fill NaN for pose
-for col in ['position_agreement', 'pose_detected', 'pose_confidence', 'body_orientation_angle']:
+# Fill NaN for all features (use 0.0 for numeric, False for boolean)
+numeric_cols_to_fill = [
+    'position_agreement', 'pose_detected', 'pose_confidence', 'body_orientation_angle',
+    'angle_to_manual_trapezoid', 'angle_to_segformer_road',
+    'torso_lean_angle', 'head_orientation_angle', 'leg_separation',
+    'estimated_stride_ratio', 'arm_crossing_score',
+    'min_distance_to_vehicle', 'min_distance_to_vehicle_norm', 'nearby_pedestrians_count',
+    'relative_x_to_vehicle', 'relative_y_to_vehicle',
+    'traffic_density', 'pedestrian_density', 'road_area_ratio', 'distance_to_road_center',
+    'road_segments_count', 'is_intersection', 'image_blur_score', 'image_brightness',
+    'local_road_ratio', 'regional_road_ratio', 'global_road_ratio',
+    'distance_to_left_edge', 'distance_to_right_edge', 'distance_to_top_edge',
+    'distance_to_bottom_edge', 'position_x_norm', 'position_y_norm'
+]
+
+for col in numeric_cols_to_fill:
     if col in df.columns:
         df[col] = df[col].fillna(0.0)
 
-# Interaction features
+# Fill boolean columns with False
+boolean_cols_to_fill = ['in_manual_trapezoid', 'bbox_inside_manual', 'in_segformer_road', 
+                       'bbox_inside_segformer', 'pose_detected']
+for col in boolean_cols_to_fill:
+    if col in df.columns:
+        df[col] = df[col].fillna(False).astype(float)  # Convert to float for model compatibility
+
+# Interaction features (using SAFE features only - no leaking features)
+# Note: Removed interactions with body_orientation_angle and position_agreement (leaking features)
 if 'bbox_area_norm' in df.columns and 'pose_confidence' in df.columns:
     df['area_pose_confidence_interaction'] = df['bbox_area_norm'] * df['pose_confidence']
 if 'bbox_center_y_norm' in df.columns and 'pose_confidence' in df.columns:
     df['position_pose_confidence_interaction'] = df['bbox_center_y_norm'] * df['pose_confidence']
-if 'body_orientation_angle' in df.columns and 'position_agreement' in df.columns:
-    df['orientation_agreement_interaction'] = (np.abs(df['body_orientation_angle']) / 180.0) * df['position_agreement']
-if 'bbox_area_norm' in df.columns and 'body_orientation_angle' in df.columns:
-    df['area_orientation_interaction'] = df['bbox_area_norm'] * (np.abs(df['body_orientation_angle']) / 180.0)
-if 'pose_confidence' in df.columns and 'body_orientation_angle' in df.columns:
-    df['pose_orientation_interaction'] = df['pose_confidence'] * (np.abs(df['body_orientation_angle']) / 180.0)
 
-# Feature selection
+# Removed leaking feature interactions:
+# - orientation_agreement_interaction (uses body_orientation_angle + position_agreement)
+# - area_orientation_interaction (uses body_orientation_angle)
+# - pose_orientation_interaction (uses body_orientation_angle)
+
+# Alternative safe interactions using advanced pose features instead
+if 'bbox_area_norm' in df.columns and 'torso_lean_angle' in df.columns:
+    df['area_orientation_interaction'] = df['bbox_area_norm'] * (np.abs(df['torso_lean_angle']) / 180.0)
+if 'pose_confidence' in df.columns and 'torso_lean_angle' in df.columns:
+    df['pose_orientation_interaction'] = df['pose_confidence'] * (np.abs(df['torso_lean_angle']) / 180.0)
+if 'torso_lean_angle' in df.columns and 'head_orientation_angle' in df.columns:
+    df['orientation_agreement_interaction'] = (np.abs(df['torso_lean_angle']) / 180.0) * (np.abs(df['head_orientation_angle']) / 180.0)
+
+# Feature selection - EXCLUDE DATA LEAKAGE FEATURES
+# These features are directly used in conflict_score formula and cause data leakage:
+# - in_manual_trapezoid, in_segformer_road (used in position_score, 0.65 weight)
+# - bbox_inside_manual, bbox_inside_segformer (used in position_score)
+# - position_agreement (used in agreement_score, 0.10 weight)
+# - angle_to_manual_trapezoid, angle_to_segformer_road (used in pose_score, 0.25 weight)
+# - body_orientation_angle (used in pose_score, 0.25 weight)
+
+# Features to EXCLUDE (data leakage - directly used in conflict_score formula)
+leaking_features = [
+    'in_manual_trapezoid',      # Used in position_score (0.65 weight)
+    'in_segformer_road',        # Used in position_score (0.65 weight)
+    'bbox_inside_manual',       # Used in position_score
+    'bbox_inside_segformer',    # Used in position_score
+    'position_agreement',        # Used in agreement_score (0.10 weight)
+    'angle_to_manual_trapezoid', # Used in pose_score (0.25 weight)
+    'angle_to_segformer_road',   # Used in pose_score
+    'body_orientation_angle',    # Used in pose_score (0.25 weight)
+]
+
+# SAFE features (NOT used in conflict_score formula - no data leakage)
 normalized_bbox_features = ['bbox_x1_norm', 'bbox_y1_norm', 'bbox_x2_norm', 'bbox_y2_norm',
                            'bbox_center_x_norm', 'bbox_center_y_norm', 'bbox_area_norm',
                            'bbox_width_norm', 'bbox_height_norm', 'bbox_aspect_ratio']
-pose_features = ['position_agreement', 'pose_detected', 'pose_confidence', 'body_orientation_angle']
+
+# Basic pose features (raw, not computed scores)
+pose_features = ['pose_detected', 'pose_confidence']  # Removed: position_agreement, body_orientation_angle, angles
+
+# Advanced pose features (if available in CSV)
+advanced_pose_features = ['torso_lean_angle', 'head_orientation_angle', 'leg_separation',
+                         'estimated_stride_ratio', 'arm_crossing_score']
+
+# Spatial relationship features (if available in CSV) - NOT in conflict_score formula
+spatial_features = ['min_distance_to_vehicle', 'min_distance_to_vehicle_norm', 'nearby_pedestrians_count',
+                   'relative_x_to_vehicle', 'relative_y_to_vehicle']
+
+# Scene context features (if available in CSV) - NOT in conflict_score formula
+scene_features = ['traffic_density', 'pedestrian_density', 'road_area_ratio', 'distance_to_road_center',
+                 'road_segments_count', 'is_intersection', 'image_blur_score', 'image_brightness']
+
+# Multi-scale spatial features (if available in CSV) - NOT in conflict_score formula
+multiscale_features = ['local_road_ratio', 'regional_road_ratio', 'global_road_ratio',
+                      'distance_to_left_edge', 'distance_to_right_edge', 'distance_to_top_edge',
+                      'distance_to_bottom_edge', 'position_x_norm', 'position_y_norm']
+
+# Position features - REMOVED (all cause data leakage)
+# position_features = []  # All position features removed
+
+# Interaction features (computed from safe base features only)
 interaction_features = ['area_pose_confidence_interaction', 'position_pose_confidence_interaction',
                        'orientation_agreement_interaction', 'area_orientation_interaction',
                        'pose_orientation_interaction']
 
-all_features = normalized_bbox_features + pose_features + interaction_features
-feature_columns = [f for f in all_features if f in df.columns]
+# Combine all SAFE feature lists (excluding leaking features)
+all_features = (normalized_bbox_features + pose_features + advanced_pose_features + 
+               spatial_features + scene_features + multiscale_features + 
+               interaction_features)
+
+# Only use features that exist in the CSV AND are not leaking features
+feature_columns = [f for f in all_features if f in df.columns and f not in leaking_features]
+
+# Also exclude any leaking features that might be in CSV (double-check)
+feature_columns = [f for f in feature_columns if f not in leaking_features]
+
+# CRITICAL: Also exclude 'position_type' if present (derived from leaking features)
+if 'position_type' in feature_columns:
+    feature_columns.remove('position_type')
+    print("⚠ Excluded 'position_type' (derived from leaking features)")
+
+# Print which features are excluded (data leakage)
+excluded_leaking = [f for f in leaking_features if f in df.columns]
+if excluded_leaking:
+    print(f"\n{'='*60}")
+    print(f"⚠ DATA LEAKAGE PREVENTION: Excluding {len(excluded_leaking)} features")
+    print(f"{'='*60}")
+    print("These features are directly used in conflict_score formula:")
+    for feat in excluded_leaking:
+        print(f"    ✗ {feat}")
+    print(f"\n✓ Model will learn from safe features only (no formula reverse-engineering)")
+    print(f"{'='*60}\n")
+
+# FINAL VERIFICATION: Ensure no leaking features are in feature_columns
+leaking_found = [f for f in feature_columns if f in leaking_features or f == 'position_type']
+if leaking_found:
+    print(f"⚠ ERROR: Found leaking features in feature_columns: {leaking_found}")
+    print("Removing them now...")
+    feature_columns = [f for f in feature_columns if f not in leaking_features and f != 'position_type']
+    print(f"✓ Removed leaking features. Using {len(feature_columns)} safe features.")
+
+# Print which features are missing
+missing_features = [f for f in all_features if f not in df.columns]
+if missing_features:
+    print(f"⚠ Note: {len(missing_features)} expected features not found in CSV (will be skipped):")
+    for feat in missing_features[:10]:  # Show first 10
+        print(f"    - {feat}")
+    if len(missing_features) > 10:
+        print(f"    ... and {len(missing_features) - 10} more")
 
 # Separate categorical and continuous
 continuous_cols = []
@@ -231,9 +346,10 @@ data_config = DataConfig(
 )
 
 # Create model config with regularization
+# Reduced learning rate to slow down convergence (was 3e-4, now 1e-4)
 model_config_kwargs = {
     'task': "regression",
-    'learning_rate': 3e-4,
+    'learning_rate': 1e-4,  # Reduced from 3e-4 for slower, more gradual learning
     'num_heads': 4,
     'num_attn_blocks': 3,
 }
@@ -274,25 +390,45 @@ optimizer_config = OptimizerConfig(
 )
 
 # Trainer config with anti-overfitting measures from README
-# Start with basic supported parameters
+# Updated to slow down learning: larger batch size, gradient clipping, LR scheduler
 trainer_config_kwargs = {
-    'batch_size': 128,
+    'batch_size': 256,  # Increased from 128 for smoother gradients and slower learning
     'max_epochs': 40,  # Reduced to 40 epochs as requested
     'early_stopping': "valid_loss",
     'early_stopping_patience': 15,  # README: Patience=15
+    'gradient_clip_val': 1.0,  # NEW: Clip gradients to prevent large updates
     'accelerator': 'gpu' if torch.cuda.is_available() else 'cpu',
     'devices': 1 if torch.cuda.is_available() else None,
 }
 
-# Try to add early_stopping_min_delta (check if parameter exists)
+# Try to add early_stopping_min_delta and learning rate scheduler
 trainer_config = None
 try:
-    # First try with min_delta
+    # First try with min_delta and LR scheduler
     trainer_config_kwargs['early_stopping_min_delta'] = 1e-5  # README: min_delta=1e-5
+    
+    # Try to add learning rate scheduler for gradual learning
+    try:
+        trainer_config_kwargs['learning_rate_scheduler'] = 'ReduceLROnPlateau'
+        trainer_config_kwargs['learning_rate_scheduler_params'] = {
+            'mode': 'min',
+            'factor': 0.5,  # Reduce LR by 50% when plateau detected
+            'patience': 5,  # Wait 5 epochs before reducing LR
+            'min_lr': 1e-6  # Minimum learning rate
+        }
+        print("✓ Learning rate scheduler added: ReduceLROnPlateau")
+    except (TypeError, ValueError, AttributeError) as lr_e:
+        # LR scheduler might not be supported, continue without it
+        trainer_config_kwargs.pop('learning_rate_scheduler', None)
+        trainer_config_kwargs.pop('learning_rate_scheduler_params', None)
+        print(f"⚠ Learning rate scheduler not supported, continuing without it")
+    
     trainer_config = TrainerConfig(**trainer_config_kwargs)
 except (TypeError, ValueError) as e:
     # If min_delta not supported, remove it and try again
     trainer_config_kwargs.pop('early_stopping_min_delta', None)
+    trainer_config_kwargs.pop('learning_rate_scheduler', None)
+    trainer_config_kwargs.pop('learning_rate_scheduler_params', None)
     trainer_config = TrainerConfig(**trainer_config_kwargs)
     print(f"⚠ early_stopping_min_delta not supported, using default")
 
@@ -428,39 +564,39 @@ def evaluate_with_recall_focus(y_true, y_pred, thresholds, recall_target=0.75):
     
     return thresholds, recalls
 
-# Improved checkpoint saving
+# Improved checkpoint saving - Save as .pkl
 def save_ensemble_model(model, save_dir, model_index):
-    """Save model with proper checkpoint handling"""
+    """Save model as .pkl file"""
     import os
-    import shutil
+    import pickle
     
-    model_dir = os.path.join(save_dir, f"model_{model_index}")
+    model_dir = Path(save_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create directory if it doesn't exist
-    os.makedirs(model_dir, exist_ok=True)
+    # Save as .pkl file
+    pkl_path = model_dir / f"model_{model_index}.pkl"
     
     try:
-        # Save using pytorch_tabular's save method
-        model.save_model(model_dir, save_config=True, save_transformer=True)
-        
-        # Also save raw state dict as backup
-        checkpoint_path = os.path.join(model_dir, "checkpoint.ckpt")
-        if hasattr(model, 'trainer') and model.trainer is not None:
-            try:
-                model.trainer.save_checkpoint(checkpoint_path)
-            except:
-                pass
-        
-        print(f"✓ Model {model_index} saved successfully to {model_dir}")
+        # Save entire model object as pickle
+        with open(pkl_path, 'wb') as f:
+            pickle.dump(model, f)
+        print(f"✓ Model {model_index} saved to {pkl_path}")
         return True
     except Exception as e:
-        print(f"⚠ Error saving model {model_index}: {e}")
-        # Try alternative save method
+        print(f"⚠ Error saving model {model_index} as pickle: {e}")
+        # Try saving state dict as backup
         try:
             if hasattr(model, 'model'):
-                torch.save(model.model.state_dict(), 
-                          os.path.join(model_dir, "state_dict.pt"))
-                print(f"✓ Model {model_index} state dict saved as backup")
+                state_dict_path = model_dir / f"model_{model_index}_state_dict.pkl"
+                with open(state_dict_path, 'wb') as f:
+                    pickle.dump({
+                        'state_dict': model.model.state_dict(),
+                        'config': {
+                            'data_config': model.data_config if hasattr(model, 'data_config') else None,
+                            'model_config': model.model_config if hasattr(model, 'model_config') else None,
+                        }
+                    }, f)
+                print(f"✓ Model {model_index} state dict saved as backup to {state_dict_path}")
                 return True
         except Exception as e2:
             print(f"✗ Failed to save model {model_index}: {e2}")
@@ -530,16 +666,31 @@ print(f"  Max epochs: {trainer_config.max_epochs}")
 print(f"  Early stopping patience: {trainer_config.early_stopping_patience}")
 if hasattr(trainer_config, 'early_stopping_min_delta'):
     print(f"  Early stopping min_delta: {trainer_config.early_stopping_min_delta}")
+if hasattr(trainer_config, 'gradient_clip_val'):
+    print(f"  Gradient clipping: {trainer_config.gradient_clip_val}")
 if hasattr(trainer_config, 'learning_rate_scheduler'):
     print(f"  Learning rate scheduler: {trainer_config.learning_rate_scheduler}")
+    if hasattr(trainer_config, 'learning_rate_scheduler_params'):
+        print(f"    Scheduler params: {trainer_config.learning_rate_scheduler_params}")
 
 print("\n" + "-"*60)
-print("Anti-Overfitting Measures (from README):")
+print("Anti-Overfitting Measures & Learning Rate Control:")
 print("-"*60)
 print("✓ Dropout: attn_dropout=0.1, ff_dropout=0.1, embedding_dropout=0.05")
 print("✓ Weight Decay: L2 regularization (1e-4)")
 print(f"✓ Early Stopping: Patience={trainer_config.early_stopping_patience}, min_delta={getattr(trainer_config, 'early_stopping_min_delta', 'N/A')}")
-print("⚠ Learning Rate Scheduler: Not directly configurable in TrainerConfig (may be handled internally)")
+print(f"✓ Gradient Clipping: {getattr(trainer_config, 'gradient_clip_val', 'N/A')}")
+if hasattr(trainer_config, 'learning_rate_scheduler') and trainer_config.learning_rate_scheduler:
+    print(f"✓ Learning Rate Scheduler: {trainer_config.learning_rate_scheduler}")
+    if hasattr(trainer_config, 'learning_rate_scheduler_params'):
+        params = trainer_config.learning_rate_scheduler_params
+        print(f"    - Factor: {params.get('factor', 'N/A')}")
+        print(f"    - Patience: {params.get('patience', 'N/A')}")
+        print(f"    - Min LR: {params.get('min_lr', 'N/A')}")
+else:
+    print("⚠ Learning Rate Scheduler: Not configured (may be handled internally)")
+print("✓ Reduced Learning Rate: 1e-4 (was 3e-4) for slower, more gradual learning")
+print("✓ Increased Batch Size: 256 (was 128) for smoother gradients")
 print("✓ Reduced Model Complexity: num_heads=4, num_attn_blocks=3, embed_dim=64")
 print("✓ Increased Validation Data: 70/30 train/val split")
 print("✓ Threshold Optimization: Automatic LOW/MED/HIGH threshold finding")
@@ -814,8 +965,43 @@ if TRAIN_CATBOOST:
         all_predictions['CatBoost'] = y_pred_cb
         
         print(f"✓ CatBoost trained successfully")
-        print(f"  Best iteration: {catboost_model.get_best_iteration()}")
-        print(f"  Best score: {catboost_model.get_best_score():.6f}")
+        try:
+            best_iteration = catboost_model.get_best_iteration()
+            print(f"  Best iteration: {best_iteration}")
+        except:
+            print(f"  Best iteration: N/A")
+        
+        # get_best_score() returns a dict, not a float - handle it safely
+        try:
+            best_score_dict = catboost_model.get_best_score()
+            if isinstance(best_score_dict, dict):
+                # Extract RMSE from the dict (format: {'learn': {'RMSE': value}, 'validation': {'RMSE': value}})
+                # Try validation first (more relevant), then learn
+                best_score = None
+                if 'validation' in best_score_dict:
+                    validation_scores = best_score_dict['validation']
+                    if isinstance(validation_scores, dict):
+                        best_score = validation_scores.get('RMSE', None)
+                
+                if best_score is None and 'learn' in best_score_dict:
+                    learn_scores = best_score_dict['learn']
+                    if isinstance(learn_scores, dict):
+                        best_score = learn_scores.get('RMSE', None)
+                
+                if best_score is not None and isinstance(best_score, (int, float)):
+                    print(f"  Best score (RMSE): {best_score:.6f}")
+                else:
+                    # Fallback: print the dict structure
+                    print(f"  Best score: {best_score_dict}")
+            else:
+                # If it's not a dict, try to format as float
+                if isinstance(best_score_dict, (int, float)):
+                    print(f"  Best score: {best_score_dict:.6f}")
+                else:
+                    print(f"  Best score: {best_score_dict}")
+        except Exception as score_error:
+            # If get_best_score() fails, just skip it
+            print(f"  Best score: N/A (could not retrieve: {str(score_error)[:50]})")
         
     except Exception as e:
         print(f"✗ CatBoost training error: {e}")
@@ -850,16 +1036,26 @@ try:
                 for key, value in logged.items():
                     if isinstance(value, torch.Tensor):
                         value = value.item() if value.numel() == 1 else value.cpu().numpy()
-                    training_metrics[key].append(value)
+                    if key not in training_metrics:
+                        training_metrics[key] = []
+                    if isinstance(value, (list, np.ndarray)):
+                        training_metrics[key].extend(value if isinstance(value, list) else value.tolist())
+                    else:
+                        training_metrics[key].append(value)
         
         # Check for callback metrics
         if hasattr(trainer, 'callback_metrics') and trainer.callback_metrics:
             for key, value in trainer.callback_metrics.items():
                 if isinstance(value, torch.Tensor):
                     value = value.item() if value.numel() == 1 else value.cpu().numpy()
-                training_metrics[key].append(value)
+                if key not in training_metrics:
+                    training_metrics[key] = []
+                if isinstance(value, (list, np.ndarray)):
+                    training_metrics[key].extend(value if isinstance(value, list) else value.tolist())
+                else:
+                    training_metrics[key].append(value)
         
-        # Check for CSV logger (common in PyTorch Lightning)
+        # Check for CSV logger (common in PyTorch Lightning) - PRIORITY METHOD
         if hasattr(trainer, 'loggers'):
             for logger in trainer.loggers:
                 if hasattr(logger, 'name') and 'csv' in logger.name.lower():
@@ -870,12 +1066,13 @@ try:
                         if csv_path.exists():
                             df_logs = pd.read_csv(csv_path)
                             for col in df_logs.columns:
-                                if 'loss' in col.lower() or 'mse' in col.lower():
+                                if 'loss' in col.lower() or 'mse' in col.lower() or 'mean_squared_error' in col.lower():
                                     training_metrics[col] = df_logs[col].dropna().tolist()
-                    except:
+                            print(f"  ✓ Loaded metrics from CSV logger: {len(df_logs)} rows")
+                    except Exception as csv_e:
                         pass
     
-    # Method 3: Check model save directory for logs
+    # Method 3: Check model save directory for logs (PRIORITY METHOD)
     try:
         log_dir = Path('/content/ft_transformer_model') / 'lightning_logs'
         if log_dir.exists():
@@ -887,10 +1084,35 @@ try:
                 if csv_file.exists():
                     df_logs = pd.read_csv(csv_file)
                     for col in df_logs.columns:
-                        if 'loss' in col.lower() or 'mse' in col.lower():
+                        if 'loss' in col.lower() or 'mse' in col.lower() or 'mean_squared_error' in col.lower():
                             training_metrics[col] = df_logs[col].dropna().tolist()
-    except:
+                    print(f"  ✓ Loaded metrics from CSV file: {len(df_logs)} rows, {len(training_metrics)} metrics")
+    except Exception as log_e:
         pass
+    
+    # Method 4: Try to get metrics from ensemble models if available
+    if USE_ENSEMBLE and ensemble_models:
+        try:
+            for i, ensemble_model in enumerate(ensemble_models):
+                if hasattr(ensemble_model, 'trainer') and ensemble_model.trainer is not None:
+                    trainer = ensemble_model.trainer
+                    log_dir = Path('/content/ft_transformer_model') / 'lightning_logs'
+                    if log_dir.exists():
+                        versions = sorted([d for d in log_dir.iterdir() if d.is_dir() and d.name.startswith('version')])
+                        if versions:
+                            # Try different version numbers
+                            for version_dir in versions[-3:]:  # Check last 3 versions
+                                csv_file = version_dir / 'metrics.csv'
+                                if csv_file.exists():
+                                    df_logs = pd.read_csv(csv_file)
+                                    for col in df_logs.columns:
+                                        if 'loss' in col.lower() or 'mse' in col.lower() or 'mean_squared_error' in col.lower():
+                                            if col not in training_metrics:
+                                                training_metrics[col] = []
+                                            training_metrics[col].extend(df_logs[col].dropna().tolist())
+                                    break
+        except:
+            pass
     
     # Extract and plot metrics
     train_loss = []
@@ -898,17 +1120,43 @@ try:
     train_mse = []
     val_mse = []
     
-    # Try to find loss metrics
+    # Try to find loss metrics - handle both with and without 'epoch' in key
     for key, values in training_metrics.items():
         key_lower = key.lower()
-        if 'train' in key_lower and 'loss' in key_lower and 'epoch' in key_lower:
-            train_loss = values if isinstance(values, list) else [values]
-        elif ('val' in key_lower or 'valid' in key_lower) and 'loss' in key_lower and 'epoch' in key_lower:
-            val_loss = values if isinstance(values, list) else [values]
-        elif 'train' in key_lower and 'mse' in key_lower:
-            train_mse = values if isinstance(values, list) else [values]
-        elif ('val' in key_lower or 'valid' in key_lower) and 'mse' in key_lower:
-            val_mse = values if isinstance(values, list) else [values]
+        # Check for train loss (with or without 'epoch')
+        if 'train' in key_lower and 'loss' in key_lower:
+            if isinstance(values, list):
+                train_loss = values
+            elif isinstance(values, (int, float)):
+                train_loss = [values]
+        # Check for validation loss (with or without 'epoch')
+        elif ('val' in key_lower or 'valid' in key_lower) and 'loss' in key_lower:
+            if isinstance(values, list):
+                val_loss = values
+            elif isinstance(values, (int, float)):
+                val_loss = [values]
+        # Check for train MSE
+        elif 'train' in key_lower and ('mse' in key_lower or 'mean_squared_error' in key_lower):
+            if isinstance(values, list):
+                train_mse = values
+            elif isinstance(values, (int, float)):
+                train_mse = [values]
+        # Check for validation MSE
+        elif ('val' in key_lower or 'valid' in key_lower) and ('mse' in key_lower or 'mean_squared_error' in key_lower):
+            if isinstance(values, list):
+                val_mse = values
+            elif isinstance(values, (int, float)):
+                val_mse = [values]
+    
+    # If we have the exact keys from pytorch_tabular, use them directly
+    if not train_loss and 'train_loss' in training_metrics:
+        train_loss = training_metrics['train_loss'] if isinstance(training_metrics['train_loss'], list) else [training_metrics['train_loss']]
+    if not val_loss and 'valid_loss' in training_metrics:
+        val_loss = training_metrics['valid_loss'] if isinstance(training_metrics['valid_loss'], list) else [training_metrics['valid_loss']]
+    if not train_mse and 'train_mean_squared_error' in training_metrics:
+        train_mse = training_metrics['train_mean_squared_error'] if isinstance(training_metrics['train_mean_squared_error'], list) else [training_metrics['train_mean_squared_error']]
+    if not val_mse and 'valid_mean_squared_error' in training_metrics:
+        val_mse = training_metrics['valid_mean_squared_error'] if isinstance(training_metrics['valid_mean_squared_error'], list) else [training_metrics['valid_mean_squared_error']]
     
     # Plot if we have any data
     if train_loss or val_loss or train_mse or val_mse:
@@ -1638,39 +1886,41 @@ if len(roc_auc_scores) > 1:
                 'binary': float(roc_auc_scores[model_name].get('binary', 0))
             }
 
-# Feature Importance Analysis for LOW Class Misclassifications
+# Feature Importance Analysis with SHAP for All Models
 print("\n" + "="*60)
-print("Feature Importance Analysis")
+print("SHAP Feature Importance Analysis (All Models)")
 print("="*60)
 
+# Prepare data for SHAP (use a sample for speed)
+sample_size = min(100, len(test_df))
+X_sample_df = test_df[feature_columns].iloc[:sample_size]
+X_sample = X_sample_df.values
+
+# Background dataset for PermutationExplainer (FT-Transformer)
+background_size = min(50, len(test_df))
+X_background = test_df[feature_columns].iloc[:background_size].values
+
+all_shap_results = {}
+
 try:
-    # Identify misclassified LOW samples
-    low_threshold = opt_low
-    low_true = y_test <= low_threshold
-    low_pred = y_pred <= low_threshold
-    misclassified_low = low_true & (~low_pred)  # True LOW predicted as not LOW
+    import shap
+    print("✓ SHAP library available")
     
-    if misclassified_low.sum() > 0:
-        print(f"✓ Found {misclassified_low.sum()} LOW misclassifications")
-        
-        # Try to install and use SHAP for feature importance
+    # Analyze FT-Transformer (PermutationExplainer)
+    if 'FT-Transformer' in all_models:
+        print(f"\n{'='*60}")
+        print("Analyzing FT-Transformer with SHAP")
+        print(f"{'='*60}")
         try:
-            import shap
-            print("  Using SHAP for feature importance analysis...")
-            
-            # Prepare data for SHAP (use a sample for speed)
-            sample_size = min(100, len(test_df))
-            X_sample = test_df[feature_columns].iloc[:sample_size].values
-            
-            # Get model for SHAP (use first ensemble model or single model)
+            # Get model for SHAP
             if USE_ENSEMBLE and ensemble is not None and len(ensemble_models) > 0:
                 model_for_shap = ensemble_models[0]
             else:
                 model_for_shap = model
             
-            # Create a wrapper function for SHAP
-            def model_predict_wrapper(X):
-                """Wrapper to convert numpy array to DataFrame for model prediction"""
+            # Create wrapper function for FT-Transformer
+            def ft_predict_wrapper(X):
+                """Wrapper to convert numpy array to DataFrame for FT-Transformer"""
                 X_df = pd.DataFrame(X, columns=feature_columns)
                 pred = model_for_shap.predict(X_df)
                 if isinstance(pred, pd.DataFrame):
@@ -1678,69 +1928,207 @@ try:
                         return pred['conflict_score_prediction'].values
                     else:
                         return pred.iloc[:, 0].values
-                return pred
+                return pred if isinstance(pred, np.ndarray) else np.array([pred])
             
-            # Create SHAP explainer (using a subset of data as background)
-            background_size = min(50, len(test_df))
-            X_background = test_df[feature_columns].iloc[:background_size].values
+            # Create SHAP explainer (will auto-select PermutationExplainer for function-based model)
+            print("  Creating SHAP explainer (PermutationExplainer for FT-Transformer)...")
+            explainer_ft = shap.Explainer(ft_predict_wrapper, X_background)
+            shap_values_ft = explainer_ft(X_sample)
             
-            try:
-                explainer = shap.Explainer(model_predict_wrapper, X_background)
-                shap_values = explainer(X_sample)
-                
-                # Plot feature importance
-                plt.figure(figsize=(10, 8))
-                shap.plots.bar(shap_values, show=False)
-                plt.title("Feature Importance (SHAP Values)", fontsize=14, fontweight='bold')
-                plt.tight_layout()
-                plt.savefig('/content/feature_importance_shap.png', dpi=200, bbox_inches='tight')
-                print("  ✓ Feature importance plot saved to /content/feature_importance_shap.png")
-                plt.show()
-                
-                # Get top features
-                mean_shap = np.abs(shap_values.values).mean(0)
-                top_features_idx = np.argsort(mean_shap)[-10:][::-1]
-                print("\n  Top 10 Most Important Features:")
-                for i, idx in enumerate(top_features_idx, 1):
-                    print(f"    {i:2d}. {feature_columns[idx]:40s} (SHAP: {mean_shap[idx]:.4f})")
-                
-            except Exception as e:
-                print(f"  ⚠ SHAP explainer error: {e}")
-                print("  Falling back to permutation importance...")
-                raise
-        
-        except ImportError:
-            print("  ⚠ SHAP not installed. Installing...")
-            import subprocess
-            subprocess.check_call(['pip', 'install', '-q', 'shap'])
-            import shap
-            print("  ✓ SHAP installed. Please re-run this cell for feature importance analysis.")
+            # Calculate mean absolute SHAP values
+            mean_shap_ft = np.abs(shap_values_ft.values).mean(0)
+            all_shap_results['FT-Transformer'] = {
+                'shap_values': shap_values_ft,
+                'mean_shap': mean_shap_ft,
+                'explainer_type': 'PermutationExplainer'
+            }
+            
+            print(f"  ✓ FT-Transformer SHAP analysis complete")
+            print(f"  Explainer: PermutationExplainer (auto-selected for function-based model)")
+            
         except Exception as e:
-            print(f"  ⚠ SHAP analysis failed: {e}")
-            print("  Using simple feature correlation analysis instead...")
+            print(f"  ⚠ FT-Transformer SHAP analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Analyze XGBoost (TreeExplainer)
+    if TRAIN_XGBOOST and 'XGBoost' in all_models:
+        print(f"\n{'='*60}")
+        print("Analyzing XGBoost with SHAP")
+        print(f"{'='*60}")
+        try:
+            xgb_model = all_models['XGBoost']
             
-            # Fallback: Simple correlation analysis
-            misclassified_df = test_df[misclassified_low]
-            if len(misclassified_df) > 0:
-                correlations = {}
-                for col in feature_columns:
-                    if col in misclassified_df.columns:
-                        corr = np.corrcoef(misclassified_df[col], y_test[misclassified_low])[0, 1]
-                        correlations[col] = abs(corr)
-                
-                # Sort by correlation
-                sorted_features = sorted(correlations.items(), key=lambda x: x[1], reverse=True)
-                print("\n  Top 10 Features Correlated with LOW Misclassifications:")
-                for i, (feat, corr) in enumerate(sorted_features[:10], 1):
-                    print(f"    {i:2d}. {feat:40s} (|corr|: {corr:.4f})")
-    else:
-        print("  ✓ No LOW misclassifications found - model performs well on LOW class!")
+            # Create SHAP explainer (will auto-select TreeExplainer for tree model)
+            print("  Creating SHAP explainer (TreeExplainer for XGBoost)...")
+            explainer_xgb = shap.Explainer(xgb_model)  # Auto-detects tree model
+            shap_values_xgb = explainer_xgb(X_sample_df)
+            
+            # Calculate mean absolute SHAP values
+            if hasattr(shap_values_xgb, 'values'):
+                mean_shap_xgb = np.abs(shap_values_xgb.values).mean(0)
+            else:
+                mean_shap_xgb = np.abs(shap_values_xgb).mean(0)
+            
+            all_shap_results['XGBoost'] = {
+                'shap_values': shap_values_xgb,
+                'mean_shap': mean_shap_xgb,
+                'explainer_type': 'TreeExplainer'
+            }
+            
+            print(f"  ✓ XGBoost SHAP analysis complete")
+            print(f"  Explainer: TreeExplainer (auto-selected for tree model)")
+            
+        except Exception as e:
+            print(f"  ⚠ XGBoost SHAP analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Analyze CatBoost (TreeExplainer)
+    if TRAIN_CATBOOST and 'CatBoost' in all_models:
+        print(f"\n{'='*60}")
+        print("Analyzing CatBoost with SHAP")
+        print(f"{'='*60}")
+        try:
+            cb_model = all_models['CatBoost']
+            
+            # Create SHAP explainer (will auto-select TreeExplainer for tree model)
+            print("  Creating SHAP explainer (TreeExplainer for CatBoost)...")
+            explainer_cb = shap.Explainer(cb_model)  # Auto-detects tree model
+            shap_values_cb = explainer_cb(X_sample_df)
+            
+            # Calculate mean absolute SHAP values
+            if hasattr(shap_values_cb, 'values'):
+                mean_shap_cb = np.abs(shap_values_cb.values).mean(0)
+            else:
+                mean_shap_cb = np.abs(shap_values_cb).mean(0)
+            
+            all_shap_results['CatBoost'] = {
+                'shap_values': shap_values_cb,
+                'mean_shap': mean_shap_cb,
+                'explainer_type': 'TreeExplainer'
+            }
+            
+            print(f"  ✓ CatBoost SHAP analysis complete")
+            print(f"  Explainer: TreeExplainer (auto-selected for tree model)")
+            
+        except Exception as e:
+            print(f"  ⚠ CatBoost SHAP analysis failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Generate visualizations for all models
+    if all_shap_results:
+        print(f"\n{'='*60}")
+        print("Generating SHAP Visualizations")
+        print(f"{'='*60}")
         
+        # Plot 1: Individual bar plots for each model
+        n_models = len(all_shap_results)
+        fig, axes = plt.subplots(1, n_models, figsize=(8*n_models, 6))
+        if n_models == 1:
+            axes = [axes]
+        
+        for idx, (model_name, shap_data) in enumerate(all_shap_results.items()):
+            try:
+                shap.plots.bar(shap_data['shap_values'], show=False, ax=axes[idx])
+                axes[idx].set_title(f'{model_name}\n({shap_data["explainer_type"]})', fontsize=12, fontweight='bold')
+            except Exception as e:
+                axes[idx].text(0.5, 0.5, f'Plot error:\n{str(e)[:50]}', 
+                              ha='center', va='center', transform=axes[idx].transAxes)
+                axes[idx].set_title(f'{model_name} (Error)', fontsize=12)
+        
+        plt.tight_layout()
+        plt.savefig('/content/shap_feature_importance_all_models.png', dpi=200, bbox_inches='tight')
+        print("✓ Combined SHAP bar plots saved to /content/shap_feature_importance_all_models.png")
+        plt.show()
+        
+        # Plot 2: Comparison of top features across models
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        # Get top 10 features for each model
+        top_n = 10
+        all_top_features = set()
+        feature_importance_dict = {}
+        
+        for model_name, shap_data in all_shap_results.items():
+            mean_shap = shap_data['mean_shap']
+            top_features_idx = np.argsort(mean_shap)[-top_n:][::-1]
+            top_features = [feature_columns[idx] for idx in top_features_idx]
+            all_top_features.update(top_features)
+            
+            feature_importance_dict[model_name] = {
+                'features': top_features,
+                'scores': [mean_shap[idx] for idx in top_features_idx]
+            }
+        
+        # Create comparison DataFrame
+        comparison_data = []
+        for feat in all_top_features:
+            row = {'feature': feat}
+            for model_name in all_shap_results.keys():
+                if feat in feature_importance_dict[model_name]['features']:
+                    idx = feature_importance_dict[model_name]['features'].index(feat)
+                    row[model_name] = feature_importance_dict[model_name]['scores'][idx]
+                else:
+                    row[model_name] = 0.0
+            comparison_data.append(row)
+        
+        comparison_df = pd.DataFrame(comparison_data)
+        comparison_df = comparison_df.set_index('feature')
+        
+        # Plot comparison
+        comparison_df.plot(kind='barh', ax=ax, width=0.8)
+        ax.set_xlabel('Mean |SHAP Value|', fontsize=12)
+        ax.set_ylabel('Feature', fontsize=12)
+        ax.set_title('Top Feature Importance Comparison (SHAP Values)', fontsize=14, fontweight='bold')
+        ax.legend(title='Model', fontsize=10)
+        ax.grid(True, alpha=0.3, axis='x')
+        plt.tight_layout()
+        plt.savefig('/content/shap_feature_importance_comparison.png', dpi=200, bbox_inches='tight')
+        print("✓ Feature importance comparison saved to /content/shap_feature_importance_comparison.png")
+        plt.show()
+        
+        # Print top features for each model
+        print(f"\n{'='*60}")
+        print("Top 10 Most Important Features (SHAP Values)")
+        print(f"{'='*60}")
+        
+        for model_name, shap_data in all_shap_results.items():
+            mean_shap = shap_data['mean_shap']
+            top_features_idx = np.argsort(mean_shap)[-top_n:][::-1]
+            
+            print(f"\n{model_name} ({shap_data['explainer_type']}):")
+            print(f"{'Rank':<6} {'Feature':<40} {'Mean |SHAP|':<15}")
+            print("-" * 65)
+            for i, idx in enumerate(top_features_idx, 1):
+                print(f"{i:<6} {feature_columns[idx]:<40} {mean_shap[idx]:<15.4f}")
+        
+        # Summary statistics
+        print(f"\n{'='*60}")
+        print("SHAP Analysis Summary")
+        print(f"{'='*60}")
+        print(f"Models analyzed: {len(all_shap_results)}")
+        for model_name, shap_data in all_shap_results.items():
+            print(f"  {model_name}: {shap_data['explainer_type']}")
+        print(f"Sample size: {sample_size} instances")
+        print(f"Background size: {background_size} instances (for PermutationExplainer)")
+        
+except ImportError:
+    print("⚠ SHAP not installed. Installing...")
+    import subprocess
+    try:
+        subprocess.check_call(['pip', 'install', '-q', 'shap'])
+        import shap
+        print("✓ SHAP installed. Please re-run this cell for feature importance analysis.")
+    except Exception as e:
+        print(f"✗ Failed to install SHAP: {e}")
+        print("  Continuing without SHAP analysis...")
 except Exception as e:
-    print(f"  ⚠ Feature importance analysis error: {e}")
+    print(f"⚠ SHAP analysis error: {e}")
     import traceback
     traceback.print_exc()
-    print("  Continuing without feature importance analysis...")
+    print("  Continuing without SHAP analysis...")
 
 # Save model(s)
 model_save_path = '/content/ft_transformer_model'
@@ -1750,62 +2138,62 @@ print("="*60)
 try:
     Path(model_save_path).mkdir(parents=True, exist_ok=True)
     
+    import pickle
+    
     if USE_ENSEMBLE and ensemble is not None:
-        # Save each ensemble model using improved checkpoint handling
+        # Save each ensemble model as .pkl
         ensemble_dir = Path(model_save_path) / 'ensemble'
         ensemble_dir.mkdir(exist_ok=True)
         
         for i, ensemble_model in enumerate(ensemble_models):
-            save_ensemble_model(ensemble_model, str(ensemble_dir), i+1)
+            pkl_path = ensemble_dir / f"ft_transformer_model_{i+1}.pkl"
+            try:
+                with open(pkl_path, 'wb') as f:
+                    pickle.dump(ensemble_model, f)
+                print(f"✓ FT-Transformer ensemble model {i+1} saved to {pkl_path}")
+            except Exception as e:
+                print(f"⚠ Error saving ensemble model {i+1}: {e}")
+                save_ensemble_model(ensemble_model, str(ensemble_dir), i+1)
         
-        # Also save primary model
+        # Save primary model as .pkl
+        primary_pkl_path = Path(model_save_path) / 'ft_transformer_model.pkl'
         try:
-            model.save_model(model_save_path)
-            print(f"✓ FT-Transformer model saved to {model_save_path}")
+            with open(primary_pkl_path, 'wb') as f:
+                pickle.dump(model, f)
+            print(f"✓ FT-Transformer primary model saved to {primary_pkl_path}")
         except Exception as e:
             print(f"⚠ Error saving primary model: {e}")
-            save_ensemble_model(model, model_save_path, "primary")
+            save_ensemble_model(model, str(model_save_path), "primary")
     else:
+        # Save single model as .pkl
+        single_pkl_path = Path(model_save_path) / 'ft_transformer_model.pkl'
         try:
-            model.save_model(model_save_path)
-            print(f"✓ FT-Transformer model saved to {model_save_path}")
+            with open(single_pkl_path, 'wb') as f:
+                pickle.dump(model, f)
+            print(f"✓ FT-Transformer model saved to {single_pkl_path}")
         except Exception as e:
             print(f"⚠ Error saving model: {e}")
-            save_ensemble_model(model, model_save_path, "single")
+            save_ensemble_model(model, str(model_save_path), "single")
     
-    # Save XGBoost model
+    # Save XGBoost model as .pkl
     if TRAIN_XGBOOST and xgb_model is not None:
-        xgb_save_path = Path(model_save_path) / 'xgboost_model.json'
+        xgb_pkl_path = Path(model_save_path) / 'xgboost_model.pkl'
         try:
-            xgb_model.save_model(str(xgb_save_path))
-            print(f"✓ XGBoost model saved to {xgb_save_path}")
+            with open(xgb_pkl_path, 'wb') as f:
+                pickle.dump(xgb_model, f)
+            print(f"✓ XGBoost model saved to {xgb_pkl_path}")
         except Exception as e:
-            print(f"⚠ Error saving XGBoost model: {e}")
-            # Try alternative save method
-            try:
-                import pickle
-                with open(str(xgb_save_path).replace('.json', '.pkl'), 'wb') as f:
-                    pickle.dump(xgb_model, f)
-                print(f"✓ XGBoost model saved as pickle")
-            except Exception as e2:
-                print(f"✗ Failed to save XGBoost model: {e2}")
+            print(f"✗ Failed to save XGBoost model: {e}")
     
-    # Save CatBoost model
+    # Save CatBoost model as .pkl
     if TRAIN_CATBOOST and catboost_model is not None:
-        cb_save_path = Path(model_save_path) / 'catboost_model.cbm'
+        cb_pkl_path = Path(model_save_path) / 'catboost_model.pkl'
         try:
-            catboost_model.save_model(str(cb_save_path))
-            print(f"✓ CatBoost model saved to {cb_save_path}")
+            with open(cb_pkl_path, 'wb') as f:
+                pickle.dump(catboost_model, f)
+            print(f"✓ CatBoost model saved to {cb_pkl_path}")
         except Exception as e:
-            print(f"⚠ Error saving CatBoost model: {e}")
-            # Try alternative save method
-            try:
-                import pickle
-                with open(str(cb_save_path).replace('.cbm', '.pkl'), 'wb') as f:
-                    pickle.dump(catboost_model, f)
-                print(f"✓ CatBoost model saved as pickle")
-            except Exception as e2:
-                print(f"✗ Failed to save CatBoost model: {e2}")
+            print(f"✗ Failed to save CatBoost model: {e}")
                 
 except Exception as e:
     print(f"⚠ Error saving model: {e}")

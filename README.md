@@ -479,7 +479,7 @@ The training script automatically trains and compares all three models:
    - Comparison metrics: `outputs/model_comparison_metrics.json` (all models)
 
 **Usage:**
-```python
+     ```python
 # In train_ft_transformer_conflict.py
 TRAIN_XGBOOST = True  # Enable XGBoost training
 TRAIN_CATBOOST = True  # Enable CatBoost training
@@ -588,7 +588,7 @@ shap.waterfall_plot(explainer.expected_value, shap_values[0], X_test.iloc[0])
 **FT-Transformer Attention Maps:**
 
 1. **Extract Attention Weights**:
-   ```python
+```python
    # Hook into transformer layers
    attention_weights = []
    

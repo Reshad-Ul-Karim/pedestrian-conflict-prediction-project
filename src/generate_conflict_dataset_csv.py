@@ -555,19 +555,64 @@ def generate_csv_dataset(rsud20k_dir, output_csv, calibration_file=None,
     output_path = Path(output_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Write header first - RAW FEATURES ONLY (no deterministic/computed scores)
+    # Write header first - ALL RAW FEATURES (no deterministic/computed scores)
     essential_columns = [
+        # Identifiers
         'image_id', 'person_id',
+        
+        # Detection (RAW)
         'yolo_confidence',
         'bbox_x1', 'bbox_y1', 'bbox_x2', 'bbox_y2',
         'bbox_center_x', 'bbox_center_y', 'bbox_area',
+        
+        # Position (RAW booleans and types)
         'in_manual_trapezoid', 'bbox_inside_manual',
         'in_segformer_road', 'bbox_inside_segformer',
         'position_type', 'position_agreement',
+        
+        # Pose (RAW)
         'pose_detected', 'pose_confidence',
         'angle_to_manual_trapezoid', 'angle_to_segformer_road',
         'body_orientation_angle',
+        
+        # Advanced Pose Features
+        'torso_lean_angle',
+        'head_orientation_angle',
+        'leg_separation',
+        'estimated_stride_ratio',
+        'arm_crossing_score',
+        
+        # Spatial Relationship Features
+        'min_distance_to_vehicle',
+        'min_distance_to_vehicle_norm',
+        'nearby_pedestrians_count',
+        'relative_x_to_vehicle',
+        'relative_y_to_vehicle',
+        
+        # Scene Context Features
+        'traffic_density',
+        'pedestrian_density',
+        'road_area_ratio',
+        'distance_to_road_center',
+        'road_segments_count',
+        'is_intersection',
+        'image_blur_score',
+        'image_brightness',
+        
+        # Multi-scale Spatial Features
+        'local_road_ratio',
+        'regional_road_ratio',
+        'global_road_ratio',
+        'distance_to_left_edge',
+        'distance_to_right_edge',
+        'distance_to_top_edge',
+        'distance_to_bottom_edge',
+        'position_x_norm',
+        'position_y_norm',
+        
+        # Target variable (NOT a feature, just the target)
         'conflict_score', 'risk_level',
+        
         # REMOVED deterministic features:
         # 'pose_score', 'position_score', 'distance_score_segformer', 'agreement_score'
     ]
